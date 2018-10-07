@@ -5,8 +5,14 @@ import (
 
 	context "golang.org/x/net/context"
 
-	"github.com/apanda/timer-test/pb"
+	"github.com/nyu-distributed-systems-fa18/starter-code-lab2/pb"
 )
+
+// The struct for data to send over channel
+type InputChannelType struct {
+	command  pb.Command
+	response chan pb.Result
+}
 
 // The struct for key value stores.
 type KVStore struct {
@@ -94,5 +100,29 @@ func (s *KVStore) CasInternal(k string, v string, vn string) pb.Result {
 		return pb.Result{Result: &pb.Result_Kv{Kv: &pb.KeyValue{Key: k, Value: vn}}}
 	} else {
 		return pb.Result{Result: &pb.Result_Kv{Kv: &pb.KeyValue{Key: k, Value: vc}}}
+	}
+}
+
+func (s *KVStore) HandleCommand(op InputChannelType) {
+	switch c := op.command; c.Operation {
+	case pb.Op_GET:
+		arg := c.GetGet()
+		result := s.GetInternal(arg.Key)
+		op.response <- result
+	case pb.Op_SET:
+		arg := c.GetSet()
+		result := s.SetInternal(arg.Key, arg.Value)
+		op.response <- result
+	case pb.Op_CLEAR:
+		result := s.ClearInternal()
+		op.response <- result
+	case pb.Op_CAS:
+		arg := c.GetCas()
+		result := s.CasInternal(arg.Kv.Key, arg.Kv.Value, arg.Value.Value)
+		op.response <- result
+	default:
+		// Sending a blank response to just free things up, but we don't know how to make progress here.
+		op.response <- pb.Result{}
+		log.Fatalf("Unrecognized operation %v", c)
 	}
 }

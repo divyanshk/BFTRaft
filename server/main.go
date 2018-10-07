@@ -2,26 +2,31 @@ package main
 
 import (
 	"flag"
+	"fmt"
 	"log"
 	rand "math/rand"
 	"net"
+	"os"
 	"time"
 
 	"google.golang.org/grpc"
 
-	"github.com/apanda/timer-test/pb"
+	"github.com/nyu-distributed-systems-fa18/starter-code-lab2/pb"
 )
 
 func main() {
-	// Constants
-	const Port = ":3000"
-
 	// Argument parsing
 	var r *rand.Rand
 	var seed int64
 	var peers arrayPeers
+	var clientPort int
+	var raftPort int
 	flag.Int64Var(&seed, "seed", -1,
 		"Seed for random number generator, values less than 0 result in use of time")
+	flag.IntVar(&clientPort, "port", 3000,
+		"Port on which server should listen to client requests")
+	flag.IntVar(&raftPort, "raft", 3001,
+		"Port on which server should listen to Raft requests")
 	flag.Var(&peers, "peer", "A peer for this process")
 	flag.Parse()
 
@@ -32,8 +37,20 @@ func main() {
 		r = rand.New(rand.NewSource(seed))
 	}
 
-	// Create socket that listens on port 3000
-	c, err := net.Listen("tcp", Port)
+	// Get hostname
+	name, err := os.Hostname()
+	if err != nil {
+		// Without a host name we can't really get an ID, so die.
+		log.Fatalf("Could not get hostname")
+	}
+
+	id := fmt.Sprintf("%s:%d", name, raftPort)
+	log.Printf("Starting peer with ID %s", id)
+
+	// Convert port to a string form
+	portString := fmt.Sprintf(":%d", clientPort)
+	// Create socket that listens on the supplied port
+	c, err := net.Listen("tcp", portString)
 	if err != nil {
 		// Note the use of Fatalf which will exit the program after reporting the error.
 		log.Fatalf("Could not create listening socket %v", err)
@@ -43,12 +60,12 @@ func main() {
 
 	// Initialize KVStore
 	store := KVStore{C: make(chan InputChannelType), store: make(map[string]string)}
-	go serve(&store, &peers, r)
+	go serve(&store, r, &peers, id, raftPort)
 
 	// Tell GRPC that s will be serving requests for the KvStore service and should use store (defined on line 23)
 	// as the struct whose methods should be called in response.
 	pb.RegisterKvStoreServer(s, &store)
-	log.Printf("Going to listen on port %v", Port)
+	log.Printf("Going to listen on port %v", clientPort)
 	// Start serving, this will block this function and only return when done.
 	if err := s.Serve(c); err != nil {
 		log.Fatalf("Failed to serve %v", err)

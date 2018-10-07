@@ -60,7 +60,7 @@ service KvStore {
     rpc CAS(CASArg) returns (Result) {}
 }
 
-// Internal Raft representations.
+// Internal representations for operations.
 enum Op {
     GET = 0;
     SET = 1;
@@ -77,4 +77,40 @@ message Command {
         Empty clear = 4;
         CASArg cas = 5;
     }
+}
+
+// Input to AppendEntries (as defined in Figure 2)
+message AppendEntriesArgs {
+    int64 term = 1;
+    string leaderID = 2;
+    int64 prevLogIndex = 3;
+    int64 prevLogTerm = 4;
+    int64 leaderCommit = 5;
+    repeated Command entries = 6;
+}
+
+// Output from AppendEntries
+message AppendEntriesRet {
+    int64 term = 1;
+    bool success = 2;
+}
+
+// Input to RequestVote
+message RequestVoteArgs {
+    int64 term = 1;
+    string candidateID = 2;
+    int64 lastLogIndex = 3;
+    int64 lasLogTerm = 4;
+}
+
+// Output from RequestVote
+message RequestVoteRet {
+    int64 term = 1;
+    bool voteGranted = 2;
+}
+
+// Raft service
+service Raft {
+    rpc AppendEntries(AppendEntriesArgs) returns (AppendEntriesRet) {}
+    rpc RequestVote(RequestVoteArgs) returns (RequestVoteRet) {}
 }
