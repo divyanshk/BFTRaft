@@ -19,6 +19,7 @@ def find_pods(v1):
     return pods_we_own
 
 def shutdown_pod(v1, name, namespace):
+    """Shutdown a single pod"""
     response = v1.delete_namespaced_pod(name, \
             namespace,\
             client.V1DeleteOptions(),
@@ -43,6 +44,7 @@ def get_service(v1, service):
     return v1.list_service_for_all_namespaces(watch=False, field_selector="metadata.name=%s"%service)
 
 def boot_pod(v1, pod_spec, service_spec, name, peers):
+    """Boot a single pod"""
     pod_spec = copy.deepcopy(pod_spec)
     # Create a pod spec for this pod.
     pod_spec['metadata']['name'] = name
