@@ -79,6 +79,13 @@ message Command {
     }
 }
 
+// A log entry
+message Entry {
+    int64 term = 1;
+    int64 index = 2;
+    Command cmd = 3;
+}
+
 // Input to AppendEntries (as defined in Figure 2)
 message AppendEntriesArgs {
     int64 term = 1;
@@ -86,7 +93,7 @@ message AppendEntriesArgs {
     int64 prevLogIndex = 3;
     int64 prevLogTerm = 4;
     int64 leaderCommit = 5;
-    repeated Command entries = 6;
+    repeated Entry entries = 6;
 }
 
 // Output from AppendEntries
