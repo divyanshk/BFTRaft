@@ -31,6 +31,20 @@ type Raft struct {
 	VoteChan   chan VoteInput
 }
 
+type State struct {
+	currentTerm	 int64
+	votedFor	 string
+	commitIndex  int64
+	lastApplied  int64
+	log			 []pb.Entry
+}
+
+type LeaderState struct {
+	common		State
+	nextIndex	[]int64
+	matchIndex	[]int64s
+}
+
 func (r *Raft) AppendEntries(ctx context.Context, arg *pb.AppendEntriesArgs) (*pb.AppendEntriesRet, error) {
 	c := make(chan pb.AppendEntriesRet)
 	r.AppendChan <- AppendEntriesInput{arg: arg, response: c}
@@ -105,6 +119,10 @@ func connectToPeer(peer string) (pb.RaftClient, error) {
 // The main service loop. All modifications to the KV store are run through here.
 func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int) {
 	raft := Raft{AppendChan: make(chan AppendEntriesInput), VoteChan: make(chan VoteInput)}
+
+	// Initialize the state variables
+	// TODO:
+
 	// Start in a Go routine so it doesn't affect us.
 	go RunRaftServer(&raft, port)
 
@@ -142,6 +160,10 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int) {
 		select {
 		case <-timer.C:
 			// The timer went off.
+			// Increment currentTerm
+			state.currentTerm += 1
+			// Vote for self
+			state.votedFor = id
 			log.Printf("Timeout")
 			for p, c := range peerClients {
 				// Send in parallel so we don't wait for each client.
@@ -169,7 +191,13 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int) {
 			// We received a RequestVote RPC from a raft peer
 			// TODO: Fix this.
 			log.Printf("Received vote request from %v", vr.arg.CandidateID)
-			vr.response <- pb.RequestVoteRet{Term: 1, VoteGranted: false}
+			if vr.arg.term < state.currentTerm {
+				// Reply false if term < currentTerm
+				vr.response <- pb.RequestVoteRet{Term: state.currentTerm, VoteGranted: false}
+			} else if state.votedFor == nil !! state.votedFor == vr.arg.candidateID {
+				// If votedFor is null or candidateID, grant vote
+				vr.response <- pb.RequestVoteRet{Term: state.currentTerm, VoteGranted: false}
+			}
 		case vr := <-voteResponseChan:
 			// We received a response to a previou vote request.
 			// TODO: Fix this
