@@ -232,30 +232,38 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int) {
 			// TODO figure out what to do here, what we do is entirely wrong.
 			if ae.arg.Term < state.currentTerm {
 				// Stale AppendEntries
-				ae.response <- pb.AppendEntriesRet{Term: ae.arg.Term, Success: false}
+				ae.response <- pb.AppendEntriesRet{Term: state.currentTerm, Success: false}
 			} else if ae.arg.Term > state.currentTerm {
 				// If term is greater, than turn into a follower
-				state.voteCounts = 0
 				state.currentTerm = ae.arg.Term
-				state.votedFor = ""
 				state.leaderID = ae.arg.LeaderID
-				timerHeartBeat = time.NewTimer(300 * time.Millisecond)
+				state.voteCounts = 0
+				state.votedFor = ""
 				// TODO: handle cases relating to log updates
+				ae.response <- pb.AppendEntriesRet{Term: state.currentTerm, Success: true}
 				restartTimer(timer, r)
-				ae.response <- pb.AppendEntriesRet{Term: ae.arg.Term, Success: true}
 			} else if ae.arg.Term == state.currentTerm { // && ae.arg.entries != nil
 				log.Printf("Received append entry from %v", ae.arg.LeaderID)
+				ae.response <- pb.AppendEntriesRet{Term: state.currentTerm, Success: true}
 				restartTimer(timer, r)
-				ae.response <- pb.AppendEntriesRet{Term: ae.arg.Term, Success: true}
 			}
 		case vr := <-raft.VoteChan:
 			// We received a RequestVote RPC from a raft peer
 			// TODO: Fix this.
 			log.Printf("Received vote request from %v", vr.arg.CandidateID)
 			if vr.arg.Term < state.currentTerm {
-				// Reply false if term < currentTerm
-				vr.response <- pb.RequestVoteRet{Term: vr.arg.Term, VoteGranted: false}
-			} else if (state.votedFor == "" || state.votedFor == vr.arg.CandidateID) {// TODO: &&  {
+				// Reply false if term < currentTerm, send currentTerm for candidate to updated itself
+				vr.response <- pb.RequestVoteRet{Term: state.currentTerm, VoteGranted: false}
+			} else if vr.arg.Term > state.currentTerm {
+				// Change to the request's term and grant vote
+				// TODO: Is the candidate's log 'up-to-date' as receriver's ? Assuming YES for now.
+				state.currentTerm = vr.arg.Term
+				state.voteCounts = 0
+				state.votedFor = ""
+				state.leaderID = ""
+				vr.response <- pb.RequestVoteRet{Term: state.currentTerm, VoteGranted: true}
+				restartTimer(timer, r)
+			} else if (state.votedFor == "" || state.votedFor == vr.arg.CandidateID) {// TODO: && (LOGS UPTODATE) {
 				// If votedFor is null or candidateID, grant vote
 				vr.response <- pb.RequestVoteRet{Term: vr.arg.Term, VoteGranted: true}
 				restartTimer(timer, r)
@@ -264,8 +272,6 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int) {
 				vr.response <- pb.RequestVoteRet{Term: vr.arg.Term, VoteGranted: false}
 			}
 		case vr := <-voteResponseChan:
-			// We received a response to a previous vote request.
-			// TODO: Fix this
 			if vr.err != nil {
 				// Do not do Fatalf here since the peer might be gone but we should survive.
 				log.Printf("Error calling RPC %v", vr.err)
@@ -277,7 +283,7 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int) {
 					if vr.ret.VoteGranted == true {
 						state.voteCounts += 1
 						// Check if you made the majority
-						if state.voteCounts >= int64(1+len(*peers)+1/2) {
+						if state.voteCounts >= int64(1+(len(*peers)+1)/2) {
 							// Become leader, announce, restart heartbeat, stop timer
 							log.Printf("\n Leader elected: %v for term %v \n", id, vr.ret.Term)
 							state.votedFor = ""
@@ -295,11 +301,33 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int) {
 							}
 						}
 					}
+				} else if vr.ret.Term > state.currentTerm {
+					// If term is greater, than turn into a follower
+					state.currentTerm = vr.ret.Term
+					state.voteCounts = 0
+					state.votedFor = ""
+					state.leaderID = ""
+					// TODO: handle cases relating to log updates
+					restartTimer(timer, r)
 				}
 			}
 		case ar := <-appendResponseChan:
 			// We received a response to a previous AppendEntries RPC call
-			log.Printf("Got append entries response %v from %v", ar.ret.Success, ar.peer)
+			if ar.err != nil {
+				// Do not do Fatalf here since the peer might be gone but we should survive.
+				log.Printf("Error calling RPC %v", ar.err)
+			} else {
+				log.Printf("Got append entries response %v from %v", ar.ret.Success, ar.peer)
+				if ar.ret.Term > state.currentTerm {
+					// If term is greater, than turn into a follower
+					state.currentTerm = ar.ret.Term
+					state.voteCounts = 0
+					state.votedFor = ""
+					state.leaderID = ""
+					// TODO: handle cases relating to log updates
+					restartTimer(timer, r)
+				}
+			}
 		}
 	}
 	log.Printf("Strange to arrive here")
