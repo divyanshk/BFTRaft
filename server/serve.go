@@ -64,8 +64,8 @@ func (r *Raft) RequestVote(ctx context.Context, arg *pb.RequestVoteArgs) (*pb.Re
 // Compute a random duration in milliseconds
 func randomDuration(r *rand.Rand) time.Duration {
 	// Constant
-	const DurationMax = 40000
-	const DurationMin = 10000
+	const DurationMax = 4000
+	const DurationMin = 1000
 	return time.Duration(r.Intn(DurationMax-DurationMin)+DurationMin) * time.Millisecond
 }
 
@@ -82,6 +82,20 @@ func restartTimer(timer *time.Timer, r *rand.Rand) {
 
 	}
 	timer.Reset(randomDuration(r))
+}
+
+func restartHeartBeat(timer *time.Timer) {
+	stopped := timer.Stop()
+	// If stopped is false that means someone stopped before us, which could be due to the timer going off before this,
+	// in which case we just drain notifications.
+	if !stopped {
+		// Loop for any queued notifications
+		for len(timer.C) > 0 {
+			<-timer.C
+		}
+
+	}
+	timer.Reset(300 * time.Millisecond)
 }
 
 // Launch a GRPC service for this Raft peer.
@@ -124,12 +138,13 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int) {
 
 	// Initialize the state variables
 	state := State{
-		currentTerm: 0,
 		votedFor: "",
-		log: make([]pb.Entry, 0),
+		leaderID: "",
+		currentTerm: 0,
 		commitIndex: 0,
 		lastApplied: 0,
 		voteCounts: 0,
+		log: make([]pb.Entry, 0),
 	}
 
 	// Start in a Go routine so it doesn't affect us.
@@ -163,7 +178,7 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int) {
 
 	// Create a timer and start running it
 	timer := time.NewTimer(randomDuration(r))
-	timerHeartBeat := time.NewTimer(500 * time.Millisecond)
+	timerHeartBeat := time.NewTimer(300 * time.Millisecond)
 
 	// Run forever handling inputs from various channels
 	for {
@@ -186,9 +201,11 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int) {
 			restartTimer(timer, r)
 		case <-timerHeartBeat.C:
 			// Send another heartbeat to every Peer
+			// log.Printf("Heartbeat timer timeout")
 			if id == state.leaderID {
 				// Only the leader can send heartbeats to other Peers
 				// Send empty AppendEntries RPCs
+				log.Printf("Leader %v sending heartbeats", id)
 				for p, c := range peerClients {
 					// Send in parallel so we don't wait for each client.
 					go func(c pb.RaftClient, p string) {
@@ -196,8 +213,8 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int) {
 						appendResponseChan <- AppendResponse{ret: ret, err: err, peer: p}
 					}(c, p)
 				}
-				timerHeartBeat.Reset(500 * time.Millisecond)
 			}
+			restartHeartBeat(timerHeartBeat)
 		case op := <-s.C:
 			// We received an operation from a client
 			// TODO: Figure out if you can actually handle the request here. If not use the Redirect result to send the
@@ -217,11 +234,12 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int) {
 				// Stale AppendEntries
 				ae.response <- pb.AppendEntriesRet{Term: ae.arg.Term, Success: false}
 			} else if ae.arg.Term > state.currentTerm {
-				// if term is greater, than turn a follower
+				// If term is greater, than turn into a follower
 				state.voteCounts = 0
 				state.currentTerm = ae.arg.Term
 				state.votedFor = ""
 				state.leaderID = ae.arg.LeaderID
+				timerHeartBeat = time.NewTimer(300 * time.Millisecond)
 				// TODO: handle cases relating to log updates
 				restartTimer(timer, r)
 				ae.response <- pb.AppendEntriesRet{Term: ae.arg.Term, Success: true}
@@ -260,11 +278,13 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int) {
 						state.voteCounts += 1
 						// Check if you made the majority
 						if state.voteCounts >= int64(1+len(*peers)+1/2) {
-							// Become leader, announce
+							// Become leader, announce, restart heartbeat, stop timer
 							log.Printf("\n Leader elected: %v for term %v \n", id, vr.ret.Term)
 							state.votedFor = ""
 							state.leaderID = id
 							state.voteCounts = 0
+							timer.Stop()
+							restartHeartBeat(timerHeartBeat)
 							// Send empty AppendEntries RPCs
 							for p, c := range peerClients {
 								// Send in parallel so we don't wait for each client.
