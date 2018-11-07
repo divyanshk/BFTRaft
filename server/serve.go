@@ -38,7 +38,7 @@ type State struct {
 	voteCounts	 int64
 	leaderID	 string
 	votedFor	 string
-	log			 []pb.Entry
+	log			 []*pb.Entry
 }
 
 type LeaderState struct {
@@ -144,7 +144,7 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int) {
 		commitIndex: 0,
 		lastApplied: 0,
 		voteCounts: 0,
-		log: make([]pb.Entry, 0),
+		log: make([]*pb.Entry, 0),
 	}
 
 	// Start in a Go routine so it doesn't affect us.
@@ -193,7 +193,12 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int) {
 			for p, c := range peerClients {
 				// Send in parallel so we don't wait for each client.
 				go func(c pb.RaftClient, p string) {
-					ret, err := c.RequestVote(context.Background(), &pb.RequestVoteArgs{Term: state.currentTerm, CandidateID: id })// TODO: })
+					ret, err := c.RequestVote(
+						context.Background(),
+						&pb.RequestVoteArgs{
+							Term: state.currentTerm,
+							CandidateID: id,
+						})// TODO: })
 					voteResponseChan <- VoteResponse{ret: ret, err: err, peer: p}
 				}(c, p)
 			}
@@ -209,7 +214,13 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int) {
 				for p, c := range peerClients {
 					// Send in parallel so we don't wait for each client.
 					go func(c pb.RaftClient, p string) {
-						ret, err := c.AppendEntries(context.Background(), &pb.AppendEntriesArgs{Term: state.currentTerm, LeaderID: id })// TODO: })
+						ret, err := c.AppendEntries(
+							context.Background(),
+							&pb.AppendEntriesArgs{
+								Term: state.currentTerm,
+								LeaderID: id,
+								// TODO: })
+							})
 						appendResponseChan <- AppendResponse{ret: ret, err: err, peer: p}
 					}(c, p)
 				}
@@ -222,10 +233,31 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int) {
 			// TODO: Use Raft to make sure it is safe to actually run the command.
 			if id == state.leaderID {
 				// TODO: Replicate the command to every peer and wait for majority
-				s.HandleCommand(op)
+				var oldLogLength int64 = int64(len(state.log))
+				var prevLogTerm int64 = int64(-1)
+				if oldLogLength != 0 {
+					prevLogTerm = state.log[oldLogLength-1].GetTerm()
+				}
+				state.log = append(state.log, &pb.Entry{Term: state.currentTerm, Index: oldLogLength + 1, Cmd: &op.command})
+				for p, c := range peerClients {
+					// Send in parallel so we don't wait for each client.
+					go func(c pb.RaftClient, p string) {
+						ret, err := c.AppendEntries(
+							context.Background(),
+							&pb.AppendEntriesArgs{
+								Term: state.currentTerm,
+								LeaderID: id,
+								PrevLogIndex: oldLogLength,
+								PrevLogTerm: prevLogTerm,
+								LeaderCommit: state.commitIndex,
+								Entries: state.log[oldLogLength:],
+							})
+						appendResponseChan <- AppendResponse{ret: ret, err: err, peer: p}
+					}(c, p)
+				}
 			} else {
 				// TODO: Redirect to leader
-				s.HandleCommand(op)
+				op.response <- pb.Result{Result: &pb.Result_Redirect{&pb.Redirect{Server: state.leaderID}}}
 			}
 		case ae := <-raft.AppendChan:
 			// We received an AppendEntries request from a Raft peer
