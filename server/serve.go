@@ -39,6 +39,8 @@ type State struct {
 	leaderID	 string
 	votedFor	 string
 	log			 []*pb.Entry
+	nextIndex    map[string]int
+	matchIndex	 map[string]int
 }
 
 type LeaderState struct {
@@ -132,11 +134,29 @@ func connectToPeer(peer string) (pb.RaftClient, error) {
 	return pb.NewRaftClient(conn), nil
 }
 
+// Max returns the larger of x or y.
+func Max(x, y int64) int64 {
+    if x < y {
+        return y
+    }
+    return x
+}
+
+// Min returns the smaller of x or y.
+func Min(x, y int64) int64 {
+    if x > y {
+        return y
+    }
+    return x
+}
+
 // The main service loop. All modifications to the KV store are run through here.
 func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int) {
 	raft := Raft{AppendChan: make(chan AppendEntriesInput), VoteChan: make(chan VoteInput)}
 
-	// Initialize the state variables
+	// ********************************************************
+	// Initialize the state variables. Begin in follower state.
+	// ********************************************************
 	state := State{
 		votedFor: "",
 		leaderID: "",
@@ -145,6 +165,14 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int) {
 		lastApplied: 0,
 		voteCounts: 0,
 		log: make([]*pb.Entry, 0),
+		nextIndex: make(map[string]int),
+		matchIndex: make(map[string]int),
+	}
+
+	// Initialize nextIndex and matchIndex
+	for _, peer := range *peers {
+		state.nextIndex[peer] = 0
+		state.matchIndex[peer] = 0
 	}
 
 	// Start in a Go routine so it doesn't affect us.
@@ -164,6 +192,8 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int) {
 
 	type AppendResponse struct {
 		ret  *pb.AppendEntriesRet
+		lengthEntries int64
+		prevLogIndex int64
 		err  error
 		peer string
 	}
@@ -183,8 +213,11 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int) {
 	// Run forever handling inputs from various channels
 	for {
 		select {
+
 		case <-timer.C:
-			// The timer went off.
+			// ***********************************
+			// The timer went off. Start election.
+			// ***********************************
 			state.currentTerm += 1 // Increment currentTerm
 			state.votedFor = id // Vote for self
 			state.voteCounts += 1 // Increment votes received count
@@ -202,11 +235,11 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int) {
 					voteResponseChan <- VoteResponse{ret: ret, err: err, peer: p}
 				}(c, p)
 			}
-			// This will also take care of any pesky timeouts that happened while processing the operation.
 			restartTimer(timer, r)
+
+
 		case <-timerHeartBeat.C:
 			// Send another heartbeat to every Peer
-			// log.Printf("Heartbeat timer timeout")
 			if id == state.leaderID {
 				// Only the leader can send heartbeats to other Peers
 				// Send empty AppendEntries RPCs
@@ -221,24 +254,31 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int) {
 								LeaderID: id,
 								// TODO: })
 							})
-						appendResponseChan <- AppendResponse{ret: ret, err: err, peer: p}
+						appendResponseChan <- AppendResponse{
+							ret: ret,
+							err: err,
+							peer: p,
+						}
 					}(c, p)
 				}
 			}
 			restartHeartBeat(timerHeartBeat)
+
+
 		case op := <-s.C:
-			// We received an operation from a client
-			// TODO: Figure out if you can actually handle the request here. If not use the Redirect result to send the
-			// client elsewhere.
-			// TODO: Use Raft to make sure it is safe to actually run the command.
 			if id == state.leaderID {
 				// TODO: Replicate the command to every peer and wait for majority
 				var oldLogLength int64 = int64(len(state.log))
 				var prevLogTerm int64 = int64(-1)
 				if oldLogLength != 0 {
-					prevLogTerm = state.log[oldLogLength-1].GetTerm()
+					prevLogTerm = state.log[oldLogLength - 1].GetTerm()
 				}
-				state.log = append(state.log, &pb.Entry{Term: state.currentTerm, Index: oldLogLength + 1, Cmd: &op.command})
+				state.log = append(state.log,
+					&pb.Entry{
+					Term: state.currentTerm,
+					Index: oldLogLength, // accounting for zero indexed logs
+					Cmd: &op.command,
+				})
 				for p, c := range peerClients {
 					// Send in parallel so we don't wait for each client.
 					go func(c pb.RaftClient, p string) {
@@ -247,38 +287,78 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int) {
 							&pb.AppendEntriesArgs{
 								Term: state.currentTerm,
 								LeaderID: id,
-								PrevLogIndex: oldLogLength,
+								PrevLogIndex: oldLogLength-1,
 								PrevLogTerm: prevLogTerm,
 								LeaderCommit: state.commitIndex,
 								Entries: state.log[oldLogLength:],
 							})
-						appendResponseChan <- AppendResponse{ret: ret, err: err, peer: p}
+						appendResponseChan <- AppendResponse{
+							ret: ret,
+							err: err,
+							peer: p,
+							prevLogIndex: int64(oldLogLength-1),
+							lengthEntries: 1,
+						}
 					}(c, p)
 				}
 			} else {
 				// TODO: Redirect to leader
-				op.response <- pb.Result{Result: &pb.Result_Redirect{&pb.Redirect{Server: state.leaderID}}}
+				op.response <- pb.Result{
+					Result: &pb.Result_Redirect{
+						&pb.Redirect{Server: state.leaderID}}}
 			}
+
+
 		case ae := <-raft.AppendChan:
 			// We received an AppendEntries request from a Raft peer
 			// TODO figure out what to do here, what we do is entirely wrong.
 			if ae.arg.Term < state.currentTerm {
 				// Stale AppendEntries
 				ae.response <- pb.AppendEntriesRet{Term: state.currentTerm, Success: false}
-			} else if ae.arg.Term > state.currentTerm {
+			} else if ae.arg.Term >= state.currentTerm {
+				// **********************************************
 				// If term is greater, than turn into a follower
+				// **********************************************
 				state.currentTerm = ae.arg.Term
 				state.leaderID = ae.arg.LeaderID
 				state.voteCounts = 0
 				state.votedFor = ""
-				// TODO: handle cases relating to log updates
-				ae.response <- pb.AppendEntriesRet{Term: state.currentTerm, Success: true}
-				restartTimer(timer, r)
-			} else if ae.arg.Term == state.currentTerm { // && ae.arg.entries != nil
-				log.Printf("Received append entry from %v", ae.arg.LeaderID)
-				ae.response <- pb.AppendEntriesRet{Term: state.currentTerm, Success: true}
-				restartTimer(timer, r)
+				if ae.arg.PrevLogIndex < int64(len(state.log)) {
+					if state.log[ae.arg.PrevLogIndex].GetTerm() == ae.arg.PrevLogTerm {
+						// append new entries after ae.arg.PrevLogIndex
+						if len(ae.arg.Entries) != 0 {
+							// make sure to append only for the entries the request catered
+							totalLength := ae.arg.PrevLogIndex + int64(1) + int64(len(ae.arg.Entries))
+							if totalLength < int64(len(state.log)) {
+								state.log = append(
+												append(
+													state.log[:(ae.arg.PrevLogIndex + 1)],
+													ae.arg.Entries...),
+												state.log[totalLength:]...)
+							} else {
+								state.log = append(
+									state.log[:(ae.arg.PrevLogIndex + 1)],
+									ae.arg.Entries...)
+							}
+						}
+						// update commitIndex, and lsatApplied if needed
+						if ae.arg.LeaderCommit > state.commitIndex {
+							state.commitIndex = Min(ae.arg.LeaderCommit, int64(len(state.log)) - 1)
+							if state.commitIndex > state.lastApplied {
+								// TODO: entry committed, apply to state machine
+							}
+						}
+						ae.response <- pb.AppendEntriesRet{Term: state.currentTerm, Success: true}
+						restartTimer(timer, r)
+					} else {
+						ae.response <- pb.AppendEntriesRet{Term: state.currentTerm, Success: false}
+					}
+				} else {
+					ae.response <- pb.AppendEntriesRet{Term: state.currentTerm, Success: false}
+				}
 			}
+
+
 		case vr := <-raft.VoteChan:
 			// We received a RequestVote RPC from a raft peer
 			// TODO: Fix this.
@@ -288,21 +368,28 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int) {
 				vr.response <- pb.RequestVoteRet{Term: state.currentTerm, VoteGranted: false}
 			} else if vr.arg.Term > state.currentTerm {
 				// Change to the request's term and grant vote
-				// TODO: Is the candidate's log 'up-to-date' as receriver's ? Assuming YES for now.
 				state.currentTerm = vr.arg.Term
 				state.voteCounts = 0
-				state.votedFor = ""
+				state.votedFor = vr.arg.CandidateID
 				state.leaderID = ""
 				vr.response <- pb.RequestVoteRet{Term: state.currentTerm, VoteGranted: true}
 				restartTimer(timer, r)
-			} else if (state.votedFor == "" || state.votedFor == vr.arg.CandidateID) {// TODO: && (LOGS UPTODATE) {
+			} else if (state.votedFor == "" || state.votedFor == vr.arg.CandidateID) {
 				// If votedFor is null or candidateID, grant vote
-				vr.response <- pb.RequestVoteRet{Term: vr.arg.Term, VoteGranted: true}
-				restartTimer(timer, r)
+				if vr.arg.LasLogTerm > state.log[len(state.log) - 1].GetTerm() {
+					vr.response <- pb.RequestVoteRet{Term: state.currentTerm, VoteGranted: true}
+					restartTimer(timer, r)
+				} else if vr.arg.LastLogIndex == state.log[len(state.log) - 1].GetTerm() {
+					if vr.arg.LastLogIndex >= int64(len(state.log)) {
+						vr.response <- pb.RequestVoteRet{Term: state.currentTerm, VoteGranted: true}
+						restartTimer(timer, r)
+					}
+				}
 			} else {
-				// TODO:
-				vr.response <- pb.RequestVoteRet{Term: vr.arg.Term, VoteGranted: false}
+				vr.response <- pb.RequestVoteRet{Term: state.currentTerm, VoteGranted: false}
 			}
+
+
 		case vr := <-voteResponseChan:
 			if vr.err != nil {
 				// Do not do Fatalf here since the peer might be gone but we should survive.
@@ -311,24 +398,50 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int) {
 				// Only cater to vote responses of the term candidate is waiting for.
 				if vr.ret.Term == state.currentTerm {
 					log.Printf("Got response to vote request from %v", vr.peer)
-					log.Printf("Peers %s granted %v term %v", vr.peer, vr.ret.VoteGranted, vr.ret.Term)
+					log.Printf("Peers %s granted %v term %v",
+															vr.peer,
+															vr.ret.VoteGranted,
+															vr.ret.Term)
 					if vr.ret.VoteGranted == true {
 						state.voteCounts += 1
 						// Check if you made the majority
 						if state.voteCounts >= int64(1+(len(*peers)+1)/2) {
-							// Become leader, announce, restart heartbeat, stop timer
-							log.Printf("\n Leader elected: %v for term %v \n", id, vr.ret.Term)
+							// *******************************************************
+							// Become leader, announce, restart heartbeat, stop timer.
+							// *******************************************************
+							log.Printf("\n Leader elected: %v for term %v \n",
+																			id,
+																			vr.ret.Term)
 							state.votedFor = ""
 							state.leaderID = id
 							state.voteCounts = 0
+							for _, peer := range *peers {
+								state.nextIndex[peer] = 0
+								state.matchIndex[peer] = 0
+							}
 							timer.Stop()
 							restartHeartBeat(timerHeartBeat)
 							// Send empty AppendEntries RPCs
 							for p, c := range peerClients {
 								// Send in parallel so we don't wait for each client.
 								go func(c pb.RaftClient, p string) {
-									ret, err := c.AppendEntries(context.Background(), &pb.AppendEntriesArgs{Term: state.currentTerm, LeaderID: id })// TODO: })
-									appendResponseChan <- AppendResponse{ret: ret, err: err, peer: p}
+									ret, err := c.AppendEntries(
+										context.Background(),
+										&pb.AppendEntriesArgs{
+											Term: state.currentTerm,
+											LeaderID: id,
+											PrevLogIndex: int64(len(state.log)) - 1,
+											PrevLogTerm: state.log[len(state.log) - 1].GetTerm(),
+											LeaderCommit: state.commitIndex,
+											Entries: state.log[0:0],
+										})
+									appendResponseChan <- AppendResponse{
+										ret: ret,
+										err: err,
+										peer: p,
+										prevLogIndex: int64(len(state.log)) - 1,
+										lengthEntries: 0,
+									}
 								}(c, p)
 							}
 						}
@@ -343,13 +456,17 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int) {
 					restartTimer(timer, r)
 				}
 			}
+
+
 		case ar := <-appendResponseChan:
 			// We received a response to a previous AppendEntries RPC call
 			if ar.err != nil {
 				// Do not do Fatalf here since the peer might be gone but we should survive.
 				log.Printf("Error calling RPC %v", ar.err)
 			} else {
-				log.Printf("Got append entries response %v from %v", ar.ret.Success, ar.peer)
+				log.Printf("Got append entries response %v from %v",
+																ar.ret.Success,
+																ar.peer)
 				if ar.ret.Term > state.currentTerm {
 					// If term is greater, than turn into a follower
 					state.currentTerm = ar.ret.Term
@@ -358,6 +475,47 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int) {
 					state.leaderID = ""
 					// TODO: handle cases relating to log updates
 					restartTimer(timer, r)
+				} else {
+					if ar.ret.Success == false {
+						// Decrement nextIndex and retry
+						state.nextIndex[ar.peer] -= 1
+						go func(c pb.RaftClient, p string) {
+							ret, err := c.AppendEntries(
+								context.Background(),
+								&pb.AppendEntriesArgs{
+									Term: state.currentTerm,
+									LeaderID: id,
+									PrevLogIndex: ar.prevLogIndex - 1,
+									PrevLogTerm: state.log[ar.prevLogIndex - 1].GetTerm(),
+									LeaderCommit: state.commitIndex,
+									Entries: state.log[
+										ar.prevLogIndex :
+										ar.prevLogIndex + ar.lengthEntries + 1],
+								})
+								appendResponseChan <- AppendResponse{
+									ret: ret,
+									err: err,
+									peer: ar.peer,
+									prevLogIndex: ar.prevLogIndex - 1,
+									lengthEntries: ar.lengthEntries + 1,
+								}
+						}(peerClients[ar.peer], ar.peer)
+					} else {
+						// Update nextIndex and matchIndex for follower
+						index := int(ar.prevLogIndex + ar.lengthEntries)
+						state.matchIndex[ar.peer] = index
+						state.nextIndex[ar.peer] = state.matchIndex[ar.peer] + 1
+						// Count for majority to commit entry
+						count := 0
+						for _, ind := range state.matchIndex {
+							if ind == index {
+								count++;
+							}
+						}
+						if count >= 1+(len(*peers)+1)/2 {
+							state.commitIndex = int64(index)
+						}
+					}
 				}
 			}
 		}
