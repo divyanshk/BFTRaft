@@ -161,8 +161,8 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int) {
 		votedFor: "",
 		leaderID: "",
 		currentTerm: 0,
-		commitIndex: 0,
-		lastApplied: 0,
+		commitIndex: -1,
+		lastApplied: -1,
 		voteCounts: 0,
 		log: make([]*pb.Entry, 0),
 		nextIndex: make(map[string]int),
@@ -244,6 +244,12 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int) {
 				// Only the leader can send heartbeats to other Peers
 				// Send empty AppendEntries RPCs
 				log.Printf("Leader %v sending heartbeats", id)
+				prevLogIndex := int64(-1)
+				prevLogTerm := int64(-1)
+				if len(state.log) != 0 {
+					prevLogIndex = int64(len(state.log)) - 1
+					prevLogTerm = state.log[len(state.log) - 1].GetTerm()
+				}
 				for p, c := range peerClients {
 					// Send in parallel so we don't wait for each client.
 					go func(c pb.RaftClient, p string) {
@@ -252,7 +258,10 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int) {
 							&pb.AppendEntriesArgs{
 								Term: state.currentTerm,
 								LeaderID: id,
-								// TODO: })
+								PrevLogIndex: prevLogIndex,
+								PrevLogTerm: prevLogTerm,
+								LeaderCommit: state.commitIndex,
+								Entries: state.log[0:0], // empty log entries
 							})
 						appendResponseChan <- AppendResponse{
 							ret: ret,
@@ -268,8 +277,8 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int) {
 		case op := <-s.C:
 			if id == state.leaderID {
 				// TODO: Replicate the command to every peer and wait for majority
-				var oldLogLength int64 = int64(len(state.log))
-				var prevLogTerm int64 = int64(-1)
+				oldLogLength := int64(len(state.log))
+				prevLogTerm := int64(-1)
 				if oldLogLength != 0 {
 					prevLogTerm = state.log[oldLogLength - 1].GetTerm()
 				}
@@ -323,8 +332,9 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int) {
 				state.leaderID = ae.arg.LeaderID
 				state.voteCounts = 0
 				state.votedFor = ""
-				if ae.arg.PrevLogIndex < int64(len(state.log)) {
-					if state.log[ae.arg.PrevLogIndex].GetTerm() == ae.arg.PrevLogTerm {
+				if ae.arg.PrevLogIndex <= int64(len(state.log)) {
+					if ae.arg.PrevLogIndex == -1 ||
+					   state.log[ae.arg.PrevLogIndex].GetTerm() == ae.arg.PrevLogTerm {
 						// append new entries after ae.arg.PrevLogIndex
 						if len(ae.arg.Entries) != 0 {
 							// make sure to append only for the entries the request catered
@@ -376,7 +386,10 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int) {
 				restartTimer(timer, r)
 			} else if (state.votedFor == "" || state.votedFor == vr.arg.CandidateID) {
 				// If votedFor is null or candidateID, grant vote
-				if vr.arg.LasLogTerm > state.log[len(state.log) - 1].GetTerm() {
+				if len(state.log) == 0 {
+					vr.response <- pb.RequestVoteRet{Term: state.currentTerm, VoteGranted: true}
+					restartTimer(timer, r)
+				} else if vr.arg.LasLogTerm > state.log[len(state.log) - 1].GetTerm() {
 					vr.response <- pb.RequestVoteRet{Term: state.currentTerm, VoteGranted: true}
 					restartTimer(timer, r)
 				} else if vr.arg.LastLogIndex == state.log[len(state.log) - 1].GetTerm() {
@@ -421,6 +434,13 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int) {
 							}
 							timer.Stop()
 							restartHeartBeat(timerHeartBeat)
+							prevLogIndex := int64(-1)
+							prevLogTerm := int64(-1)
+							if len(state.log) != 0 {
+								prevLogIndex = int64(len(state.log)) - 1
+								prevLogTerm = state.log[len(state.log) - 1].GetTerm()
+							}
+
 							// Send empty AppendEntries RPCs
 							for p, c := range peerClients {
 								// Send in parallel so we don't wait for each client.
@@ -430,16 +450,16 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int) {
 										&pb.AppendEntriesArgs{
 											Term: state.currentTerm,
 											LeaderID: id,
-											PrevLogIndex: int64(len(state.log)) - 1,
-											PrevLogTerm: state.log[len(state.log) - 1].GetTerm(),
+											PrevLogIndex: prevLogIndex,
+											PrevLogTerm: prevLogTerm,
 											LeaderCommit: state.commitIndex,
-											Entries: state.log[0:0],
+											Entries: state.log[0:0], // empty log entries
 										})
 									appendResponseChan <- AppendResponse{
 										ret: ret,
 										err: err,
 										peer: p,
-										prevLogIndex: int64(len(state.log)) - 1,
+										prevLogIndex: prevLogIndex,
 										lengthEntries: 0,
 									}
 								}(c, p)
@@ -479,6 +499,14 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int) {
 					if ar.ret.Success == false {
 						// Decrement nextIndex and retry
 						state.nextIndex[ar.peer] -= 1
+						prevLogTerm := int64(-1)
+						entries := state.log[0:0]
+						if len(state.log) != 0 {
+							prevLogTerm = state.log[ar.prevLogIndex - 1].GetTerm()
+							entries = state.log[
+								ar.prevLogIndex :
+								ar.prevLogIndex + ar.lengthEntries + 1]
+						}
 						go func(c pb.RaftClient, p string) {
 							ret, err := c.AppendEntries(
 								context.Background(),
@@ -486,11 +514,9 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int) {
 									Term: state.currentTerm,
 									LeaderID: id,
 									PrevLogIndex: ar.prevLogIndex - 1,
-									PrevLogTerm: state.log[ar.prevLogIndex - 1].GetTerm(),
+									PrevLogTerm: prevLogTerm,
 									LeaderCommit: state.commitIndex,
-									Entries: state.log[
-										ar.prevLogIndex :
-										ar.prevLogIndex + ar.lengthEntries + 1],
+									Entries: entries,
 								})
 								appendResponseChan <- AppendResponse{
 									ret: ret,
