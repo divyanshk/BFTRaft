@@ -9,7 +9,7 @@ import (
 	context "golang.org/x/net/context"
 	"google.golang.org/grpc"
 
-	"github.com/nyu-distributed-systems-fa18/starter-code-lab2/pb"
+	"github.com/nyu-distributed-systems-fa18/lab-2-raft-divyanshk/pb"
 )
 
 func usage() {
