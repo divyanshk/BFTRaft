@@ -178,7 +178,7 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int) {
 	// Initialize nextIndex and matchIndex
 	for _, peer := range *peers {
 		state.nextIndex[peer] = int64(0)
-		state.matchIndex[peer] = int64(0)
+		state.matchIndex[peer] = int64(-1)
 	}
 
 	// Start in a Go routine so it doesn't affect us.
@@ -276,11 +276,13 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int) {
 						prevLogIndex = lastLogIndex
 						entries = state.log[0:0]
 					}
+
 					prevLogTerm = int64(-1)
-					if prevLogIndex != -1 {
+					if prevLogIndex != int64(-1) {
 						prevLogTerm = state.log[prevLogIndex].GetTerm()
 					}
 					// Send heartbeat
+					log.Printf("Sending %v AppendEntries for nextindex %v", peer, nextIndex)
 					go func(c pb.RaftClient, p string) {
 						ret, err := c.AppendEntries(
 							context.Background(),
@@ -295,7 +297,7 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int) {
 						appendResponseChan <- AppendResponse{
 							ret: ret,
 							err: err,
-							peer: peer,
+							peer: p,
 							prevLogIndex: prevLogIndex,
 							lengthEntries: int64(len(entries)),
 						}
@@ -306,7 +308,6 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int) {
 
 
 		case op := <-s.C:
-			log.Printf("**********HERE**********")
 			s.HandleCommand(op)
 			if id == state.leaderID {
 				oldLogLength := int64(len(state.log))
@@ -316,7 +317,7 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int) {
 					Index: oldLogLength, // accounting for zero indexed logs
 					Cmd: &op.command,
 				})
-				log.Printf("LEADER APPEND: ")
+				log.Printf("Leader logs: ")
 				PrintLog(state.log)
 			} else {
 				// Redirect to leader
@@ -330,7 +331,6 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int) {
 
 		case ae := <-raft.AppendChan:
 			// We received an AppendEntries request from a Raft peer
-			// TODO figure out what to do here, what we do is entirely wrong.
 			if ae.arg.Term < state.currentTerm {
 				// Stale AppendEntries
 				ae.response <- pb.AppendEntriesRet{Term: state.currentTerm, Success: false}
@@ -338,15 +338,16 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int) {
 				// **********************************************
 				// If term is greater, than turn into a follower
 				// **********************************************
+				log.Printf("Received append entry from %v %v", ae.arg.LeaderID, ae.arg.PrevLogIndex)
 				state.currentTerm = ae.arg.Term
 				state.leaderID = ae.arg.LeaderID
 				state.voteCounts = 0
 				state.votedFor = ""
-				if ae.arg.PrevLogIndex <= int64(len(state.log)) {
-					if ae.arg.PrevLogIndex == -1 ||
+				if ae.arg.PrevLogIndex <= int64(len(state.log) - 1) {
+					if ae.arg.PrevLogIndex == int64(-1) ||
 					   state.log[ae.arg.PrevLogIndex].GetTerm() == ae.arg.PrevLogTerm {
-						// Aapend new entries after ae.arg.PrevLogIndex
-						// Make sure to append only for the entries the request catered - NO !!
+						// Append new entries after ae.arg.PrevLogIndex
+						// Make sure to append only for the entries the request catered ? NO !!
 						// Overwrite everything, the returned matchIndex udpated will trigger
 						//  another AppendEntries RPC
 						// In case of received heartbeats, this will overwrite everything
@@ -354,7 +355,7 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int) {
 						state.log = append(
 							state.log[:(ae.arg.PrevLogIndex + 1)],
 							ae.arg.Entries...)
-						log.Printf("Follower APPEND: ")
+						log.Printf("Follower logs: ")
 						PrintLog(state.log)
 
 						// update commitIndex, and lastApplied if needed
@@ -369,9 +370,11 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int) {
 						ae.response <- pb.AppendEntriesRet{Term: state.currentTerm, Success: true}
 						restartTimer(timer, r)
 					} else {
+						restartTimer(timer, r)
 						ae.response <- pb.AppendEntriesRet{Term: state.currentTerm, Success: false}
 					}
 				} else {
+					restartTimer(timer, r)
 					ae.response <- pb.AppendEntriesRet{Term: state.currentTerm, Success: false}
 				}
 			}
@@ -384,27 +387,35 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int) {
 			if vr.arg.Term < state.currentTerm {
 				// Reply false if term < currentTerm, send currentTerm for candidate to updated itself
 				vr.response <- pb.RequestVoteRet{Term: state.currentTerm, VoteGranted: false}
-			} else if vr.arg.Term > state.currentTerm {
-				// Change to the request's term and grant vote
-				state.currentTerm = vr.arg.Term
-				state.voteCounts = 0
-				state.votedFor = vr.arg.CandidateID
-				state.leaderID = ""
-				vr.response <- pb.RequestVoteRet{Term: state.currentTerm, VoteGranted: true}
-				restartTimer(timer, r)
 			} else if (state.votedFor == "" || state.votedFor == vr.arg.CandidateID) {
 				// If votedFor is null or candidateID, grant vote
 				if len(state.log) == 0 {
+					state.currentTerm = vr.arg.Term
+					state.voteCounts = 0
+					state.votedFor = vr.arg.CandidateID
+					state.leaderID = ""
 					vr.response <- pb.RequestVoteRet{Term: state.currentTerm, VoteGranted: true}
 					restartTimer(timer, r)
 				} else if vr.arg.LasLogTerm > state.log[len(state.log) - 1].GetTerm() {
+					state.currentTerm = vr.arg.Term
+					state.voteCounts = 0
+					state.votedFor = vr.arg.CandidateID
+					state.leaderID = ""
 					vr.response <- pb.RequestVoteRet{Term: state.currentTerm, VoteGranted: true}
 					restartTimer(timer, r)
-				} else if vr.arg.LastLogIndex == state.log[len(state.log) - 1].GetTerm() {
-					if vr.arg.LastLogIndex >= int64(len(state.log)) {
+				} else if vr.arg.LasLogTerm == state.log[len(state.log) - 1].GetTerm() {
+					if vr.arg.LastLogIndex >= int64(len(state.log)-1) {
+						state.currentTerm = vr.arg.Term
+						state.voteCounts = 0
+						state.votedFor = vr.arg.CandidateID
+						state.leaderID = ""
 						vr.response <- pb.RequestVoteRet{Term: state.currentTerm, VoteGranted: true}
 						restartTimer(timer, r)
+					} else {
+						vr.response <- pb.RequestVoteRet{Term: state.currentTerm, VoteGranted: false}
 					}
+				} else {
+					vr.response <- pb.RequestVoteRet{Term: state.currentTerm, VoteGranted: false}
 				}
 			} else {
 				vr.response <- pb.RequestVoteRet{Term: state.currentTerm, VoteGranted: false}
@@ -437,8 +448,8 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int) {
 							state.leaderID = id
 							state.voteCounts = 0
 							for _, peer := range *peers {
-								state.nextIndex[peer] = int64(0)
-								state.matchIndex[peer] = int64(0)
+								state.nextIndex[peer] = int64(len(state.log))
+								state.matchIndex[peer] = int64(-1)
 							}
 							timer.Stop()
 							restartHeartBeat(timerHeartBeat)
@@ -505,16 +516,18 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int) {
 				} else {
 					if ar.ret.Success == false {
 						// Decrement nextIndex and let the next heartbeat retry
-						state.nextIndex[ar.peer] -= int64(1)
+						state.nextIndex[ar.peer] = Max(state.nextIndex[ar.peer] - int64(1), int64(0))
 					} else {
 						// Update nextIndex and matchIndex for follower
 						index := ar.prevLogIndex + ar.lengthEntries
-						state.matchIndex[ar.peer] = index
-						state.nextIndex[ar.peer] = state.matchIndex[ar.peer] + int64(1)
+						state.matchIndex[ar.peer] = Max(state.matchIndex[ar.peer],
+														index)
+						state.nextIndex[ar.peer] = Max(state.nextIndex[ar.peer],
+														state.matchIndex[ar.peer] + int64(1))
 						// Count for majority to commit entry,
 						//  but only for entry of the current term
 						count := 0
-						if state.log[index].GetTerm() == state.currentTerm {
+						if index != -1 && state.log[index].GetTerm() == state.currentTerm {
 							for _, ind := range state.matchIndex {
 								if ind == index {
 									count++;
