@@ -134,17 +134,17 @@ func connectToPeer(peer string) (pb.RaftClient, error) {
 	return pb.NewRaftClient(conn), nil
 }
 
-// Max returns the larger of x or y.
-func Max(x, y int64) int64 {
-    if x < y {
+// Min returns the smaller of x or y.
+func Min(x, y int64) int64 {
+    if x > y {
         return y
     }
     return x
 }
 
-// Min returns the smaller of x or y.
-func Min(x, y int64) int64 {
-    if x > y {
+// Max returns the larger of x or y.
+func Max(x, y int64) int64 {
+    if x < y {
         return y
     }
     return x
@@ -185,6 +185,7 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int) {
 	go RunRaftServer(&raft, port)
 
 	peerClients := make(map[string]pb.RaftClient)
+	opHandler := make(map[int64]InputChannelType)
 
 	for _, peer := range *peers {
 		client, err := connectToPeer(peer)
@@ -308,7 +309,7 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int) {
 
 
 		case op := <-s.C:
-			s.HandleCommand(op)
+			// s.HandleCommand(op)
 			if id == state.leaderID {
 				oldLogLength := int64(len(state.log))
 				state.log = append(state.log,
@@ -319,13 +320,13 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int) {
 				})
 				log.Printf("Leader logs: ")
 				PrintLog(state.log)
+				opHandler[oldLogLength] = op
 			} else {
 				// Redirect to leader
-				// TODO:
 				log.Printf("Redirect command to leader")
-				// op.response <- pb.Result{
-				// 	Result: &pb.Result_Redirect{
-				// 		&pb.Redirect{Server: state.leaderID}}}
+				op.response <- pb.Result{
+					Result: &pb.Result_Redirect{
+						&pb.Redirect{Server: state.leaderID}}}
 			}
 
 
@@ -363,8 +364,12 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int) {
 							state.commitIndex = Min(ae.arg.LeaderCommit, int64(len(state.log) - 1))
 							if state.commitIndex > state.lastApplied {
 								// TODO: entry committed, apply to state machine, respond to client
-								log.Printf("state.commitIndex > state.lastApplied => Apply entry")
-								state.lastApplied = state.commitIndex
+								log.Printf("FOLLOWER: Apply entry")
+								for state.lastApplied < state.commitIndex {
+									// s.HandleCommand(state.log[state.lastApplied+1].Cmd)
+									// s.HandleCommandFollower(*state.log[state.lastApplied+1].Cmd)
+									state.lastApplied++
+								}
 							}
 						}
 						ae.response <- pb.AppendEntriesRet{Term: state.currentTerm, Success: true}
@@ -389,6 +394,13 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int) {
 				vr.response <- pb.RequestVoteRet{Term: state.currentTerm, VoteGranted: false}
 			} else if (state.votedFor == "" || state.votedFor == vr.arg.CandidateID) {
 				// If votedFor is null or candidateID, grant vote
+				if vr.arg.Term > state.currentTerm {
+					// If term is greater, than turn into a follower
+					state.currentTerm = vr.arg.Term
+					state.voteCounts = 0
+					state.votedFor = ""
+					state.leaderID = ""
+				}
 				if len(state.log) == 0 {
 					state.currentTerm = vr.arg.Term
 					state.voteCounts = 0
@@ -526,22 +538,26 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int) {
 														state.matchIndex[ar.peer] + int64(1))
 						// Count for majority to commit entry,
 						//  but only for entry of the current term
-						count := 0
-						if index != -1 && state.log[index].GetTerm() == state.currentTerm {
+						count := 1
+						if index != -1 && state.commitIndex < index && state.log[index].GetTerm() == state.currentTerm {
 							for _, ind := range state.matchIndex {
 								if ind == index {
 									count++;
 								}
 							}
 							if count >= 1+(len(*peers)+1)/2 {
-								state.commitIndex = int64(index)
+								state.commitIndex = Max(state.commitIndex, int64(index))
 								if state.commitIndex > int64(len(state.log) - 1) {
 									log.Fatalf("Something is wrong here !! commitIndex > log length")
 								}
 								if state.commitIndex > state.lastApplied {
 									// TODO: entry committed, apply to state machine, respond to client
-									log.Printf("state.commitIndex > state.lastApplied => Apply entry")
-									state.lastApplied = state.commitIndex
+									log.Printf("LEADER: Apply entry")
+									for state.lastApplied < state.commitIndex {
+										// s.HandleCommand(state.log[state.lastApplied+1].Cmd)
+										s.HandleCommand(opHandler[state.lastApplied+1])
+										state.lastApplied++
+									}
 								}
 							}
 						}
