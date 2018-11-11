@@ -309,7 +309,6 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int) {
 
 
 		case op := <-s.C:
-			// s.HandleCommand(op)
 			if id == state.leaderID {
 				oldLogLength := int64(len(state.log))
 				state.log = append(state.log,
@@ -366,8 +365,7 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int) {
 								// TODO: entry committed, apply to state machine, respond to client
 								log.Printf("FOLLOWER: Apply entry")
 								for state.lastApplied < state.commitIndex {
-									// s.HandleCommand(state.log[state.lastApplied+1].Cmd)
-									// s.HandleCommandFollower(*state.log[state.lastApplied+1].Cmd)
+									s.HandleCommandFollower(*state.log[state.lastApplied+1].Cmd)
 									state.lastApplied++
 								}
 							}
@@ -554,7 +552,6 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int) {
 									// TODO: entry committed, apply to state machine, respond to client
 									log.Printf("LEADER: Apply entry")
 									for state.lastApplied < state.commitIndex {
-										// s.HandleCommand(state.log[state.lastApplied+1].Cmd)
 										s.HandleCommand(opHandler[state.lastApplied+1])
 										state.lastApplied++
 									}
