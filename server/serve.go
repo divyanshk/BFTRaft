@@ -362,7 +362,7 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int) {
 						if ae.arg.LeaderCommit > state.commitIndex {
 							state.commitIndex = Min(ae.arg.LeaderCommit, int64(len(state.log) - 1))
 							if state.commitIndex > state.lastApplied {
-								// TODO: entry committed, apply to state machine, respond to client
+								// Entry committed, apply to state machine, respond to client
 								log.Printf("FOLLOWER: Apply entry")
 								for state.lastApplied < state.commitIndex {
 									s.HandleCommandFollower(*state.log[state.lastApplied+1].Cmd)
@@ -385,7 +385,6 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int) {
 
 		case vr := <-raft.VoteChan:
 			// We received a RequestVote RPC from a raft peer
-			// TODO: Fix this.
 			log.Printf("Received vote request from %v", vr.arg.CandidateID)
 			if vr.arg.Term < state.currentTerm {
 				// Reply false if term < currentTerm, send currentTerm for candidate to updated itself
@@ -501,7 +500,6 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int) {
 					state.voteCounts = 0
 					state.votedFor = ""
 					state.leaderID = ""
-					// TODO: handle cases relating to log updates
 					restartTimer(timer, r)
 				}
 			}
@@ -549,10 +547,14 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int) {
 									log.Fatalf("Something is wrong here !! commitIndex > log length")
 								}
 								if state.commitIndex > state.lastApplied {
-									// TODO: entry committed, apply to state machine, respond to client
+									// Entry committed, apply to state machine, respond to client
 									log.Printf("LEADER: Apply entry")
 									for state.lastApplied < state.commitIndex {
-										s.HandleCommand(opHandler[state.lastApplied+1])
+										if commandHandler, ok := opHandler[state.lastApplied+1]; ok {
+											s.HandleCommand(commandHandler)
+										} else {
+											s.HandleCommandFollower(*state.log[state.lastApplied+1].Cmd)
+										}
 										state.lastApplied++
 									}
 								}
