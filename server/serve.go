@@ -361,9 +361,11 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int) {
 								ae.arg.Entries...)
 						} else {
 							for i, entry := range ae.arg.Entries {
-								if state.log[ae.arg.PrevLogIndex + 1 + int64(i)].GetTerm() != entry.GetTerm() {
-									// found the conflicting entry, delete everything
-									// from here onwards
+								if ae.arg.PrevLogIndex + 1 + int64(i) == int64(len(state.log)) ||
+								state.log[ae.arg.PrevLogIndex + 1 + int64(i)].GetTerm() != entry.GetTerm() {
+									// Reached the end of state.log, or
+									// found the conflicting entry,
+									// delete everything from here onwards
 									state.log = append(
 										state.log[:(ae.arg.PrevLogIndex + 1 + int64(i))],
 										ae.arg.Entries[i:]...)
@@ -404,15 +406,17 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int) {
 			if vr.arg.Term < state.currentTerm {
 				// Reply false if term < currentTerm, send currentTerm for candidate to updated itself
 				vr.response <- pb.RequestVoteRet{Term: state.currentTerm, VoteGranted: false}
-			} else if (state.votedFor == "" || state.votedFor == vr.arg.CandidateID) {
-				// If votedFor is null or candidateID, grant vote
-				if vr.arg.Term > state.currentTerm {
-					// If term is greater, than turn into a follower
-					state.currentTerm = vr.arg.Term
-					state.voteCounts = 0
-					state.votedFor = ""
-					state.leaderID = ""
-				}
+				break
+			}
+			if vr.arg.Term > state.currentTerm {
+				// If receiving term is greater, then turn into a follower
+				state.currentTerm = vr.arg.Term
+				state.voteCounts = 0
+				state.votedFor = ""
+				state.leaderID = ""
+			}
+			if (state.votedFor == "" || state.votedFor == vr.arg.CandidateID) {
+				// check for cases of state.log to grant vote
 				if len(state.log) == 0 {
 					state.currentTerm = vr.arg.Term
 					state.voteCounts = 0
@@ -441,8 +445,6 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int) {
 				} else {
 					vr.response <- pb.RequestVoteRet{Term: state.currentTerm, VoteGranted: false}
 				}
-			} else {
-				vr.response <- pb.RequestVoteRet{Term: state.currentTerm, VoteGranted: false}
 			}
 
 
