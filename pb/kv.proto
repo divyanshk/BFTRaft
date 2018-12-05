@@ -86,7 +86,21 @@ message Entry {
     Command cmd = 3;
 }
 
-// Input to AppendEntries (as defined in Figure 2)
+// Signed Vote entry
+message Vote {
+    int64 peer = 1;
+    int64 term = 2
+    int64 signature = 3;
+}
+
+// Client signatures
+message ClientSignature {
+    int64 id = 1;
+    Command cmd = 2;
+    int64 signature = 3;
+}
+
+// Input to AppendEntries
 message AppendEntriesArgs {
     int64 term = 1;
     string leaderID = 2;
@@ -94,6 +108,8 @@ message AppendEntriesArgs {
     int64 prevLogTerm = 4;
     int64 leaderCommit = 5;
     repeated Entry entries = 6;
+    repeated Vote votes = 7;
+    repeated ClientSignature clientSignatures = 8;
 }
 
 // Output from AppendEntries
@@ -108,6 +124,7 @@ message RequestVoteArgs {
     string candidateID = 2;
     int64 lastLogIndex = 3;
     int64 lasLogTerm = 4;
+    repeated LeaderChangeProof proof = 5;
 }
 
 // Output from RequestVote
@@ -116,8 +133,20 @@ message RequestVoteRet {
     bool voteGranted = 2;
 }
 
+// Request Leader Change
+message LeaderChangeArgs {
+    int64 term = 1;
+}
+
+// Proof for Leader Change request
+message LeaderChangeProof {
+    int64 peer = 1;
+    int64 term = 2;
+    int64 signature = 3;
+}
+
 // Raft service
 service Raft {
     rpc AppendEntries(AppendEntriesArgs) returns (AppendEntriesRet) {}
     rpc RequestVote(RequestVoteArgs) returns (RequestVoteRet) {}
-}
+    rpc RequestLeaderChange(LeaderChangeArgs) {}
