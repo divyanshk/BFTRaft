@@ -10,7 +10,7 @@ import (
 	context "golang.org/x/net/context"
 	"google.golang.org/grpc"
 
-	"github.com/nyu-distributed-systems-fa18/lab-2-raft-divyanshk/pb"
+	"github.com/nyu-distributed-systems-fa18/distributed-project/pb"
 )
 
 // Messages that can be passed from the Raft RPC server to the main loop for AppendEntries
@@ -19,16 +19,23 @@ type AppendEntriesInput struct {
 	response chan pb.AppendEntriesRet
 }
 
-// Messages that can be passed from the Raft RPC server to the main loop for VoteInput
+// Messages that can be passed from the Raft RPC server to the main loop for RequestVote
 type VoteInput struct {
 	arg      *pb.RequestVoteArgs
 	response chan pb.RequestVoteRet
+}
+
+// Messages that can be passed from the Raft RPC server to the main loop for RequestLeaderChange
+type LeaderChangeInput struct {
+	arg *pb.LeaderChangeProof
+	// no response needed
 }
 
 // Struct off of which we shall hang the Raft service
 type Raft struct {
 	AppendChan chan AppendEntriesInput
 	VoteChan   chan VoteInput
+	LeaderChangeChan chan LeaderChangeInput
 }
 
 type State struct {
@@ -38,6 +45,7 @@ type State struct {
 	voteCounts	 int64
 	leaderID	 string
 	votedFor	 string
+	leaderChangeVotes map[string]*pb.leaderChangeProof
 	log			 []*pb.Entry
 	nextIndex    map[string]int64
 	matchIndex	 map[string]int64
@@ -61,6 +69,10 @@ func (r *Raft) RequestVote(ctx context.Context, arg *pb.RequestVoteArgs) (*pb.Re
 	r.VoteChan <- VoteInput{arg: arg, response: c}
 	result := <-c
 	return &result, nil
+}
+
+func (r *Raft) RequestLeaderChange(ctx context.Context, arg *pb.LeaderChangeProof) (error) {
+
 }
 
 // Compute a random duration in milliseconds
@@ -157,12 +169,12 @@ func PrintLog(logs []*pb.Entry) {
 }
 
 // The main service loop. All modifications to the KV store are run through here.
-func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int) {
+func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int, f int64) {
 	raft := Raft{AppendChan: make(chan AppendEntriesInput), VoteChan: make(chan VoteInput)}
 
-	// ********************************************************
-	// Initialize the state variables. Begin in follower state.
-	// ********************************************************
+	// ***********************************************************
+	//   Initialize the state variables. Begin in follower state
+	// ***********************************************************
 	state := State{
 		votedFor: "",
 		leaderID: "",
@@ -170,6 +182,7 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int) {
 		commitIndex: -1,
 		lastApplied: -1,
 		voteCounts: 0,
+		leaderChangeVotes: make(map[string]LeaderChangeProof),
 		log: make([]*pb.Entry, 0),
 		nextIndex: make(map[string]int64),
 		matchIndex: make(map[string]int64),
@@ -210,6 +223,7 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int) {
 		err  error
 		peer string
 	}
+
 	appendResponseChan := make(chan AppendResponse)
 	voteResponseChan := make(chan VoteResponse)
 
@@ -222,35 +236,64 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int) {
 		select {
 
 		case <-timer.C:
-			// ***********************************
-			// The timer went off. Start election.
-			// ***********************************
-			state.currentTerm += 1 // Increment currentTerm
-			state.votedFor = id // Vote for self
-			state.voteCounts += 1 // Increment votes received count
-			state.leaderID = "" // Become a candidate now
-			log.Printf("Timeout")
-			lastLogIndex := int64(-1)
-			lasLogTerm := int64(-1)
-			if len(state.log) != 0 {
-				lastLogIndex = int64(len(state.log) - 1)
-				lasLogTerm = state.log[lastLogIndex].GetTerm()
-			}
-			for p, c := range peerClients {
-				// Send in parallel so we don't wait for each client.
-				go func(c pb.RaftClient, p string) {
-					ret, err := c.RequestVote(
-						context.Background(),
-						&pb.RequestVoteArgs{
-							Term: state.currentTerm,
-							CandidateID: id,
-							LastLogIndex: lastLogIndex,
-							LasLogTerm: lasLogTerm,
-						})
-					voteResponseChan <- VoteResponse{ret: ret, err: err, peer: p}
-				}(c, p)
-			}
+			// *************************************************
+			//   The timer went off. Request for leader change
+			// *************************************************
+			newCandidate = (state.currentTerm + 1) % len(peers) + 1
+			go func(c pb.RaftClient, p string) {
+				ret, err := c.RequestLeaderChange(
+					context.Background(),
+					// The args are the same as
+					// proof the candidate can
+					// use to prove it got 2f+1
+					// start election requests
+					&pb.LeaderChangeProof{
+						Peer: id,
+						Term: state.currentTerm + 1,
+						signature: 100,
+					},
+				)
+			}(peerClients[newCandidate], newCandidate)
 			restartTimer(timer, r)
+
+		case lc <-LeaderChangeChan:
+			// *****************************************
+			//     Received request to start election
+			// *****************************************
+			if lc.arg.term > state.currentTerm {
+				state.leaderChangeVotes[lc.arg.peer] = lc.arg
+				if len(state.leaderChangeVotes) >= 2*state.f+1 {
+					// Received a majority of 2f+1
+					// requests, start election
+					state.currentTerm += 1 // Increment currentTerm
+					state.votedFor = id // Vote for self
+					state.voteCounts += 1 // Increment votes received count
+					state.leaderID = "" // Become a candidate now
+					log.Printf("Timeout")
+					lastLogIndex := int64(-1)
+					lasLogTerm := int64(-1)
+					if len(state.log) != 0 {
+						lastLogIndex = int64(len(state.log) - 1)
+						lasLogTerm = state.log[lastLogIndex].GetTerm()
+					}
+					for p, c := range peerClients {
+						// Send in parallel so we don't wait for each client.
+						go func(c pb.RaftClient, p string) {
+							ret, err := c.RequestVote(
+								context.Background(),
+								&pb.RequestVoteArgs{
+									Term: state.currentTerm,
+									CandidateID: id,
+									LastLogIndex: lastLogIndex,
+									LasLogTerm: lasLogTerm,
+									Proof: state.leaderChangeVotes
+								})
+							voteResponseChan <- VoteResponse{ret: ret, err: err, peer: p}
+						}(c, p)
+					}
+					restartTimer(timer, r)
+				}
+			}
 
 
 		case <-timerHeartBeat.C:
@@ -464,9 +507,9 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int) {
 						state.voteCounts += 1
 						// Check if you made the majority
 						if state.voteCounts >= int64(1+(len(*peers)+1)/2) {
-							// *******************************************************
-							// Become leader, announce, restart heartbeat, stop timer.
-							// *******************************************************
+							// **********************************************************
+							//   Become leader, announce, restart heartbeat, stop timer
+							// **********************************************************
 							log.Printf("\n Leader elected: %v for term %v \n",
 																			id,
 																			vr.ret.Term)

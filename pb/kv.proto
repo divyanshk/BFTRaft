@@ -136,6 +136,7 @@ message RequestVoteRet {
 // Request Leader Change
 message LeaderChangeArgs {
     int64 term = 1;
+    int64 peer = 2;
 }
 
 // Proof for Leader Change request
@@ -149,4 +150,4 @@ message LeaderChangeProof {
 service Raft {
     rpc AppendEntries(AppendEntriesArgs) returns (AppendEntriesRet) {}
     rpc RequestVote(RequestVoteArgs) returns (RequestVoteRet) {}
-    rpc RequestLeaderChange(LeaderChangeArgs) {}
+    rpc RequestLeaderChange(LeaderChangeProof) {}
