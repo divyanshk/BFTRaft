@@ -31,11 +31,18 @@ type LeaderChangeInput struct {
 	// no response needed
 }
 
+// Messages that can be passed from the Raft RPC server to the main loop for AppendEntriesRes
+type AppendEntriesResInput struct {
+	arg *pb.AppendEntriesResArgs
+	// no response needed
+}
+
 // Struct off of which we shall hang the Raft service
 type Raft struct {
 	AppendChan chan AppendEntriesInput
 	VoteChan   chan VoteInput
 	LeaderChangeChan chan LeaderChangeInput
+	AppendEntriesResChan chan AppendEntriesResInput
 }
 
 type State struct {
@@ -168,6 +175,14 @@ func PrintLog(logs []*pb.Entry) {
 	}
 }
 
+func signatureVerification(entry *pb.Entry, id int64, signature int64) bool {
+	// TODO:
+}
+
+func calculateHash(oldHash int64, newEntry *pb.Entry) int64 {
+	// TODO:
+}
+
 // The main service loop. All modifications to the KV store are run through here.
 func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int, f int64) {
 	raft := Raft{AppendChan: make(chan AppendEntriesInput), VoteChan: make(chan VoteInput)}
@@ -181,11 +196,14 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int, f i
 		currentTerm: 0,
 		commitIndex: -1,
 		lastApplied: -1,
-		voteCounts: 0,
-		leaderChangeVotes: make(map[string]LeaderChangeProof),
+		hash: make([]int64, 0),
 		log: make([]*pb.Entry, 0),
+		results: make([]*pb.Result, 0),
+		votes: make(map[string]*pb.Vote),
 		nextIndex: make(map[string]int64),
 		matchIndex: make(map[string]int64),
+		commitQuorum: make(map[int64]map[string]int64),
+		leaderChangeVotes: make(map[string]LeaderChangeProof),
 	}
 
 	// Initialize nextIndex and matchIndex
@@ -256,7 +274,8 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int, f i
 			}(peerClients[newCandidate], newCandidate)
 			restartTimer(timer, r)
 
-		case lc <-LeaderChangeChan:
+
+		case lc := <-raft.LeaderChangeChan:
 			// *****************************************
 			//     Received request to start election
 			// *****************************************
@@ -303,7 +322,7 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int, f i
 				// Send empty AppendEntries RPCs
 				log.Printf("Leader %v sending heartbeats", id)
 				prevLogIndex := int64(-1)
-				prevLogTerm := int64(-1)
+				prevLogHash := int64(-1)
 				lastLogIndex := int64(-1)
 				entries := state.log[0:0]
 				if len(state.log) != 0 {
@@ -321,9 +340,9 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int, f i
 						entries = state.log[0:0]
 					}
 
-					prevLogTerm = int64(-1)
+					prevLogHash = int64(-1)
 					if prevLogIndex != int64(-1) {
-						prevLogTerm = state.log[prevLogIndex].GetTerm()
+						prevLogHash = state.hash[prevLogIndex].GetTerm()
 					}
 					// Send heartbeat
 					log.Printf("Sending %v AppendEntries for nextindex %v", peer, nextIndex)
@@ -334,9 +353,9 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int, f i
 								Term: state.currentTerm,
 								LeaderID: id,
 								PrevLogIndex: prevLogIndex,
-								PrevLogTerm: prevLogTerm,
-								LeaderCommit: state.commitIndex,
+								PrevLogHash: prevLogHash,
 								Entries: entries,
+								Votes: state.votes,
 							})
 						appendResponseChan <- AppendResponse{
 							ret: ret,
@@ -387,15 +406,27 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int, f i
 				state.voteCounts = 0
 				state.votedFor = ""
 				if ae.arg.PrevLogIndex <= int64(len(state.log) - 1) {
+					// Match with the incremental hash instead of the previous entry's term
 					if ae.arg.PrevLogIndex == int64(-1) ||
-					   state.log[ae.arg.PrevLogIndex].GetTerm() == ae.arg.PrevLogTerm {
+					   state.hash[len(state.hash)-1] == ae.arg.PrevLogHash {
 						// Append new entries after ae.arg.PrevLogIndex
-						// Make sure to append only for the entries the request catered ? NO !!
-						// Overwrite everything, the returned matchIndex udpated will trigger
-						//  another AppendEntries RPC
-						// PS - Delete an entry only if there is a mismatch
-						// In case of received heartbeats, this will overwrite everything
-						//  after PrevLogIndex
+						// Delete an entry only if there is a mismatch
+
+						// Verify each new entry by checking signatures
+						for i, entry := range ae.arg.Entries {
+							if ae.arg.ClientSignatures[i].Signature !=
+							signatureVerification(
+								entry,
+								ae.arg.ClientSignatures[i].id,
+								ae.arg.ClientSignatures[i].Signature) {
+								restartTimer(timer, r)
+								ae.response <- pb.AppendEntriesRet{Term: state.currentTerm, Success: false, NeedProof: true}
+								break
+							}
+						}
+
+						// Verify hash
+						oldLogLength = len(state.log)-1
 						if ae.arg.PrevLogIndex == int64(len(state.log)-1) {
 							// Heartbeat or a normal AppendEntry adding
 							// a new entry to the end of the list
@@ -418,18 +449,27 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int, f i
 						log.Printf("Follower logs: ")
 						PrintLog(state.log)
 
-						// update commitIndex, and lastApplied if needed
-						if ae.arg.LeaderCommit > state.commitIndex {
-							state.commitIndex = Min(ae.arg.LeaderCommit, int64(len(state.log) - 1))
-							if state.commitIndex > state.lastApplied {
-								// Entry committed, apply to state machine, respond to client
-								log.Printf("FOLLOWER: Apply entry")
-								for state.lastApplied < state.commitIndex {
-									s.HandleCommandFollower(*state.log[state.lastApplied+1].Cmd)
-									state.lastApplied++
-								}
-							}
+						// Calculate new hash for each new value (incrementally)
+						for i :=  oldLogLength+1; i < len(state.log); ++i {
+							state.hash = append(
+								state.hash,
+								calculateHash(state.hash[i-1], state.log[i]),
+							)
 						}
+
+						// Broadcast AppendEntriesRes to all peers
+						for p, c := range peerClients {
+							go func(c pb.RaftClient, p string) {
+								err := c.c(
+									context.Background(),
+									&pb.AppendEntriesRes{
+										Peer: id,
+										Index: len(state.log) - 1,
+										Hash: state.hash[len(state.hash)-1],
+									})
+							}(c, p)
+						}
+
 						ae.response <- pb.AppendEntriesRet{Term: state.currentTerm, Success: true}
 						restartTimer(timer, r)
 					} else {
@@ -442,6 +482,31 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int, f i
 				}
 			}
 
+
+		case aeres := <-AppendEntriesResChan:
+			// We received AppendEntriesRes from a peer broadcasting its
+			// 	positive response to the leader's AppendEntries request
+			if aeres.arg.Index > state.commitIndex {
+				// Save it if it is for an index higher
+				// than the node's current commit index
+				if val, ok := state.commitQuorum[aeres.arg.Index]; !ok {
+					// not present in the dict
+					state.commitQuorum[aeres.arg.Index] = make(map[string]int64)
+				}
+				state.commitQuorum[aeres.arg.Index][aeres.arg.Peer] = aeres.arg.Hash
+
+				// check for quorum on that index
+				if len(state.commitQuorum[aeres.arg.Index]) >= 2*f+1 {
+					// commit this index, delete all stores AppendEntriesRes
+					// entries of index less than this
+					state.commitIndex = aeres.arg.Index
+					for k, v:= range state.commitQuorum {
+						if k < aeres.arg.Index {
+							delete(state.commitQuorum, k)
+						}
+					}
+				}
+			}
 
 		case vr := <-raft.VoteChan:
 			// We received a RequestVote RPC from a raft peer
@@ -523,10 +588,10 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int, f i
 							timer.Stop()
 							restartHeartBeat(timerHeartBeat)
 							prevLogIndex := int64(-1)
-							prevLogTerm := int64(-1)
+							prevLogHash := int64(-1)
 							if len(state.log) != 0 {
 								prevLogIndex = int64(len(state.log)) - 1
-								prevLogTerm = state.log[len(state.log) - 1].GetTerm()
+								prevLogHash = state.hash[len(state.hash) - 1]
 							}
 							opHandler = make(map[int64]InputChannelType)
 
@@ -540,7 +605,7 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int, f i
 											Term: state.currentTerm,
 											LeaderID: id,
 											PrevLogIndex: prevLogIndex,
-											PrevLogTerm: prevLogTerm,
+											PrevLogHash: prevLogHash,
 											LeaderCommit: state.commitIndex,
 											Entries: state.log[0:0], // empty log entries
 										})
