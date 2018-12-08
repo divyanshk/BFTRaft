@@ -104,11 +104,10 @@ message AppendEntriesArgs {
     int64 term = 1;
     string leaderID = 2;
     int64 prevLogIndex = 3;
-    int64 prevLogTerm = 4;
-    int64 leaderCommit = 5;
-    repeated Entry entries = 6;
-    repeated Vote votes = 7;
-    repeated ClientSignature clientSignatures = 8;
+    int64 prevLogHash = 4;
+    repeated Entry entries = 5;
+    repeated Vote votes = 6;
+    repeated ClientSignature clientSignatures = 7;
 }
 
 // Output from AppendEntries
