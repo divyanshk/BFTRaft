@@ -89,15 +89,14 @@ message Entry {
 // Signed Vote entry
 message Vote {
     int64 peer = 1;
-    int64 term = 2
+    int64 term = 2;
     int64 signature = 3;
 }
 
 // Client signatures
 message ClientSignature {
     int64 id = 1;
-    Command cmd = 2;
-    int64 signature = 3;
+    int64 signature = 2;
 }
 
 // Input to AppendEntries
@@ -131,6 +130,7 @@ message RequestVoteArgs {
 message RequestVoteRet {
     int64 term = 1;
     bool voteGranted = 2;
+    Vote signedVote = 3; // used by the leader to prove win
 }
 
 // Request Leader Change
@@ -146,8 +146,16 @@ message LeaderChangeProof {
     int64 signature = 3;
 }
 
+// Input to AppendEntriesRes
+message AppendEntriesResArgs {
+    int64 peer = 1;
+    int64 index = 2;
+    int64 hash = 3;
+}
+
 // Raft service
 service Raft {
     rpc AppendEntries(AppendEntriesArgs) returns (AppendEntriesRet) {}
     rpc RequestVote(RequestVoteArgs) returns (RequestVoteRet) {}
     rpc RequestLeaderChange(LeaderChangeProof) {}
+    rpc AppendEntriesRes(AppendEntriesResArgs) {}
