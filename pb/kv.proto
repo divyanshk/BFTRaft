@@ -84,6 +84,7 @@ message Entry {
     int64 term = 1;
     int64 index = 2;
     Command cmd = 3;
+    Signature sign = 4;
 }
 
 // Signed Vote entry
@@ -107,13 +108,13 @@ message AppendEntriesArgs {
     int64 prevLogHash = 4;
     repeated Entry entries = 5;
     repeated Vote votes = 6;
-    repeated ClientSignature clientSignatures = 7;
 }
 
 // Output from AppendEntries
 message AppendEntriesRet {
     int64 term = 1;
     bool success = 2;
+    bool needProof = 3;
 }
 
 // Input to RequestVote
@@ -130,12 +131,6 @@ message RequestVoteRet {
     int64 term = 1;
     bool voteGranted = 2;
     Vote signedVote = 3; // used by the leader to prove win
-}
-
-// Request Leader Change
-message LeaderChangeArgs {
-    int64 term = 1;
-    int64 peer = 2;
 }
 
 // Proof for Leader Change request

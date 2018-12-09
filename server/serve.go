@@ -106,7 +106,6 @@ func restartTimer(timer *time.Timer, r *rand.Rand) {
 		for len(timer.C) > 0 {
 			<-timer.C
 		}
-
 	}
 	timer.Reset(randomDuration(r))
 }
@@ -120,7 +119,6 @@ func restartHeartBeat(timer *time.Timer) {
 		for len(timer.C) > 0 {
 			<-timer.C
 		}
-
 	}
 	timer.Reset(300 * time.Millisecond)
 }
@@ -185,11 +183,11 @@ func candidateVerification(proof []*pb.LeaderChangeProof) bool {
 	// TODO: verify that the candidate actually received 2f+1 leaderChangeVotes
 }
 
-func clientSignatureVerification(entries []*pb.Entry, signatures []*pb.ClientSignature) bool {
+func clientSignatureVerification(entries []*pb.Entry) bool {
 	// TODO: verify the each entry was signed by the issuing client
 	for i, entry := range entries {
-		if signatures[i].Signature !=
-		generateSignature( entry, signatures[i].id, signatures[i].Signature) { // TODO:
+		if entry.sign !=
+		generateSignature(entry, signatures[i].id) { // TODO:
 			return false
 		}
 	}
@@ -285,7 +283,7 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int, f i
 					&pb.LeaderChangeProof{
 						Peer: id,
 						Term: state.currentTerm + 1,
-						signature: 100, // TODO: 
+						Signature: 100, // TODO:
 					},
 				)
 			}(peerClients[newCandidate], newCandidate)
@@ -378,7 +376,6 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int, f i
 								PrevLogHash: prevLogHash,
 								Entries: entries,
 								Votes: votes,
-								// TODO: ClientSignatures: ,
 							})
 						appendResponseChan <- AppendResponse{
 							ret: ret,
@@ -401,6 +398,7 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int, f i
 					Term: state.currentTerm,
 					Index: oldLogLength, // accounting for zero indexed logs
 					Cmd: &op.command,
+					Sign: &op.signature,
 				})
 				log.Printf("Leader logs: ")
 				PrintLog(state.log)
@@ -436,7 +434,7 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int, f i
 						// Delete an entry only if there is a mismatch
 
 						// Verify each new entry by checking signatures
-						if !clientSignatureVerification(ae.arg.Entries, ae.arg.ClientSignatures) {
+						if !clientSignatureVerification(ae.arg.Entries) {
 							restartTimer(timer, r)
 							ae.response <- pb.AppendEntriesRet{Term: state.currentTerm, Success: false, NeedProof: true}
 							break
