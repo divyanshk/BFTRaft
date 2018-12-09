@@ -581,9 +581,9 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int, f i
 															vr.ret.VoteGranted,
 															vr.ret.Term)
 					if vr.ret.VoteGranted == true {
-						state.voteCounts += 1
+						state.votes[vr.arg.] = vr.ret.SignedVote
 						// Check if you made the majority
-						if state.voteCounts >= int64(1+(len(*peers)+1)/2) {
+						if len(state.votes) >= 2*f + 1 {
 							// **********************************************************
 							//   Become leader, announce, restart heartbeat, stop timer
 							// **********************************************************
@@ -592,7 +592,7 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int, f i
 																			vr.ret.Term)
 							state.votedFor = ""
 							state.leaderID = id
-							state.voteCounts = 0
+							// state.voteCounts = 0
 							for _, peer := range *peers {
 								state.nextIndex[peer] = int64(len(state.log))
 								state.matchIndex[peer] = int64(-1)
@@ -618,8 +618,8 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int, f i
 											LeaderID: id,
 											PrevLogIndex: prevLogIndex,
 											PrevLogHash: prevLogHash,
-											LeaderCommit: state.commitIndex,
 											Entries: state.log[0:0], // empty log entries
+											Votes: state.votes,
 										})
 									appendResponseChan <- AppendResponse{
 										ret: ret,
@@ -635,7 +635,7 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int, f i
 				} else if vr.ret.Term > state.currentTerm {
 					// If term is greater, than turn into a follower
 					state.currentTerm = vr.ret.Term
-					state.voteCounts = 0
+					// state.voteCounts = 0
 					state.votedFor = ""
 					state.leaderID = ""
 					restartTimer(timer, r)
