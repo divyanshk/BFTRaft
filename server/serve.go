@@ -52,10 +52,10 @@ type State struct {
 	voteCounts	 int64
 	leaderID	 string
 	votedFor	 string
-	leaderChangeVotes map[string]*pb.leaderChangeProof
 	log			 []*pb.Entry
 	nextIndex    map[string]int64
 	matchIndex	 map[string]int64
+	leaderChangeVotes map[string]*pb.leaderChangeProof
 }
 
 type LeaderState struct {
@@ -79,7 +79,13 @@ func (r *Raft) RequestVote(ctx context.Context, arg *pb.RequestVoteArgs) (*pb.Re
 }
 
 func (r *Raft) RequestLeaderChange(ctx context.Context, arg *pb.LeaderChangeProof) (error) {
+	r.LeaderChangeChan <- LeaderChangeInput{arg: arg}
+	return nil
+}
 
+func (r *Raft) AppendEntriesRes(ctx context.Context, arg *pb.AppendEntriesResArgs) (error) {
+	r.AppendEntriesResChan <- AppendEntriesResInput{arG: arg}
+	return nil
 }
 
 // Compute a random duration in milliseconds
@@ -175,8 +181,18 @@ func PrintLog(logs []*pb.Entry) {
 	}
 }
 
-func signatureVerification(entry *pb.Entry, id int64, signature int64) bool {
-	// TODO:
+func candidateVerification(proof []*pb.LeaderChangeProof) bool {
+	// TODO: verify that the candidate actually received 2f+1 leaderChangeVotes
+}
+
+func clientSignatureVerification(entries []*pb.Entry, signatures []*pb.ClientSignature) bool {
+	// TODO: verify the each entry was signed by the issuing client
+	for i, entry := range entries {
+		if signatures[i].Signature !=
+		generateSignature( entry, signatures[i].id, signatures[i].Signature) { // TODO:
+			return false
+		}
+	}
 }
 
 func calculateHash(oldHash int64, newEntry *pb.Entry) int64 {
@@ -231,7 +247,7 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int, f i
 	type AppendResponse struct {
 		ret  *pb.AppendEntriesRet
 		lengthEntries int64
-		prevLogIndex int64
+		prevLogIndex int64f
 		err  error
 		peer string
 	}
@@ -356,6 +372,7 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int, f i
 								PrevLogHash: prevLogHash,
 								Entries: entries,
 								Votes: state.votes,
+								// TODO: ClientSignatures: ,
 							})
 						appendResponseChan <- AppendResponse{
 							ret: ret,
@@ -413,16 +430,10 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int, f i
 						// Delete an entry only if there is a mismatch
 
 						// Verify each new entry by checking signatures
-						for i, entry := range ae.arg.Entries {
-							if ae.arg.ClientSignatures[i].Signature !=
-							signatureVerification(
-								entry,
-								ae.arg.ClientSignatures[i].id,
-								ae.arg.ClientSignatures[i].Signature) {
-								restartTimer(timer, r)
-								ae.response <- pb.AppendEntriesRet{Term: state.currentTerm, Success: false, NeedProof: true}
-								break
-							}
+						if !clientSignatureVerification(ae.arg.Entries, ae.arg.ClientSignatures) {
+							restartTimer(timer, r)
+							ae.response <- pb.AppendEntriesRet{Term: state.currentTerm, Success: false, NeedProof: true}
+							break
 						}
 
 						// Verify hash
@@ -516,14 +527,15 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int, f i
 				vr.response <- pb.RequestVoteRet{Term: state.currentTerm, VoteGranted: false}
 				break
 			}
-			if vr.arg.Term > state.currentTerm {
+			leaderChangeProof = candidateVerification(vr.arg.LeaderChangeProof)
+			if vr.arg.Term > state.currentTerm && leaderChangeProof {
 				// If receiving term is greater, then turn into a follower
 				state.currentTerm = vr.arg.Term
 				state.voteCounts = 0
 				state.votedFor = ""
 				state.leaderID = ""
 			}
-			if (state.votedFor == "" || state.votedFor == vr.arg.CandidateID) {
+			if (state.votedFor == "" || state.votedFor == vr.arg.CandidateID) && leaderChangeProof {
 				// check for cases of state.log to grant vote
 				if len(state.log) == 0 {
 					state.currentTerm = vr.arg.Term
