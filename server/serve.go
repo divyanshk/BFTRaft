@@ -218,6 +218,7 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int, f i
 		votes: make(map[string]*pb.Vote),
 		nextIndex: make(map[string]int64),
 		matchIndex: make(map[string]int64),
+		proofAccepted: make(map[string]bool),
 		commitQuorum: make(map[int64]map[string]int64),
 		leaderChangeVotes: make(map[string]LeaderChangeProof),
 	}
@@ -284,7 +285,7 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int, f i
 					&pb.LeaderChangeProof{
 						Peer: id,
 						Term: state.currentTerm + 1,
-						signature: 100,
+						signature: 100, // TODO: 
 					},
 				)
 			}(peerClients[newCandidate], newCandidate)
@@ -337,6 +338,7 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int, f i
 				// Only the leader can send heartbeats to other Peers
 				// Send empty AppendEntries RPCs
 				log.Printf("Leader %v sending heartbeats", id)
+				votes := make(map[string]*pb.Vote)
 				prevLogIndex := int64(-1)
 				prevLogHash := int64(-1)
 				lastLogIndex := int64(-1)
@@ -345,6 +347,7 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int, f i
 					lastLogIndex = int64(len(state.log) - 1)
 				}
 				for peer, nextIndex := range state.nextIndex {
+					votes = make(map[string]*pb.Vote)
 					// Check if last log index >= nextIndex for a follower
 					if lastLogIndex >= nextIndex {
 						// Send AppendEntries RPC with log entries starting at nextIndex
@@ -362,6 +365,9 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int, f i
 					}
 					// Send heartbeat
 					log.Printf("Sending %v AppendEntries for nextindex %v", peer, nextIndex)
+					if !state.proofAccepted[peer] {
+						votes = state.votes
+					}
 					go func(c pb.RaftClient, p string) {
 						ret, err := c.AppendEntries(
 							context.Background(),
@@ -371,7 +377,7 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int, f i
 								PrevLogIndex: prevLogIndex,
 								PrevLogHash: prevLogHash,
 								Entries: entries,
-								Votes: state.votes,
+								Votes: votes,
 								// TODO: ClientSignatures: ,
 							})
 						appendResponseChan <- AppendResponse{
@@ -596,6 +602,7 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int, f i
 							for _, peer := range *peers {
 								state.nextIndex[peer] = int64(len(state.log))
 								state.matchIndex[peer] = int64(-1)
+								state.proofAccepted[peer] = false
 							}
 							timer.Stop()
 							restartHeartBeat(timerHeartBeat)
@@ -655,49 +662,26 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int, f i
 				if ar.ret.Term > state.currentTerm {
 					// If term is greater, than turn into a follower
 					state.currentTerm = ar.ret.Term
-					state.voteCounts = 0
+					// state.voteCounts = 0
 					state.votedFor = ""
 					state.leaderID = ""
 					restartTimer(timer, r)
 				} else {
-					if ar.ret.Success == false {
+					if ar.ret.Success == false && ar.ret.NeedProof == false {
 						// Decrement nextIndex and let the next heartbeat retry
 						state.nextIndex[ar.peer] = Max(state.nextIndex[ar.peer] - int64(1), int64(0))
+					} else if ar.ret.Success == false && ar.ret.NeedProof == true {
+						// Send a new AppendEntries RPC containing the votes
+						// received during election
+						state.proofAccepted[ar.peer] = false;
 					} else {
 						// Update nextIndex and matchIndex for follower
+						state.proofAccepted[ar.peer] = true;
 						index := ar.prevLogIndex + ar.lengthEntries
 						state.matchIndex[ar.peer] = Max(state.matchIndex[ar.peer],
 														index)
 						state.nextIndex[ar.peer] = Max(state.nextIndex[ar.peer],
 														state.matchIndex[ar.peer] + int64(1))
-						// Count for majority to commit entry,
-						//  but only for entry of the current term
-						count := 1
-						if index != -1 && state.commitIndex < index && state.log[index].GetTerm() == state.currentTerm {
-							for _, ind := range state.matchIndex {
-								if ind == index {
-									count++;
-								}
-							}
-							if count >= 1+(len(*peers)+1)/2 {
-								state.commitIndex = Max(state.commitIndex, int64(index))
-								if state.commitIndex > int64(len(state.log) - 1) {
-									log.Fatalf("Something is wrong here !! commitIndex > log length")
-								}
-								if state.commitIndex > state.lastApplied {
-									// Entry committed, apply to state machine, respond to client
-									log.Printf("LEADER: Apply entry")
-									for state.lastApplied < state.commitIndex {
-										if commandHandler, ok := opHandler[state.lastApplied+1]; ok {
-											s.HandleCommand(commandHandler)
-										} else {
-											s.HandleCommandFollower(*state.log[state.lastApplied+1].Cmd)
-										}
-										state.lastApplied++
-									}
-								}
-							}
-						}
 					}
 				}
 			}
