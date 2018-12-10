@@ -7,6 +7,14 @@ import (
 	"net"
 	"time"
 
+	"bytes"
+	"strconv"
+	"math/big"
+    "crypto/rsa"
+	"crypto/md5"
+	"crypto/rand"
+    "encoding/gob"
+
 	context "golang.org/x/net/context"
 	"google.golang.org/grpc"
 
@@ -52,9 +60,15 @@ type State struct {
 	voteCounts	 int64
 	leaderID	 string
 	votedFor	 string
+	hash		 int64
+	results 	 []*pb.Result
+	publicKey	 dsa.PublicKey
+	privateKey	 dsa.PublicKey
 	log			 []*pb.Entry
 	nextIndex    map[string]int64
 	matchIndex	 map[string]int64
+	proofAccepted	map[string]bool
+	commitQuorum	map[int64]map[string]int64
 	leaderChangeVotes map[string]*pb.leaderChangeProof
 }
 
@@ -179,22 +193,52 @@ func PrintLog(logs []*pb.Entry) {
 	}
 }
 
-func candidateVerification(proof []*pb.LeaderChangeProof) bool {
+func candidateVerification(proof []*pb.LeaderChangeProof, int f) bool {
 	// TODO: verify that the candidate actually received 2f+1 leaderChangeVotes
+	if len(proof) > 2*f + 1 {
+		return true
+	}
 }
 
 func clientSignatureVerification(entries []*pb.Entry) bool {
-	// TODO: verify the each entry was signed by the issuing client
+	// Verify the each entry was signed by the issuing client
 	for i, entry := range entries {
-		if entry.sign !=
-		generateSignature(entry, signatures[i].id) { // TODO:
+		var pubkey = rsa.PublicKey{}
+	 	serPubKey := bytes.NewBuffer(entry.Signature.PublicKey.Bytes())
+		dec := gob.NewDecoder(serPubKey)
+		dec.Decode(&pubkey)
+		verifystatus := dsa.Verify(
+			&pubkey,
+			entry.Signature.SignHash,
+			entry.Signature.R,
+			entry.Signature.S,
+		)
+		if !verifystatus {
 			return false
 		}
 	}
+	return true
 }
 
 func calculateHash(oldHash int64, newEntry *pb.Entry) int64 {
 	// TODO:
+	return oldHash * 10 + newEntry.Index
+}
+
+func generateSignature(privateKey dsa.PublicKey, data int64) (int64, int64, []byte) {
+	// Sign
+	var h hash.Hash
+	h = md5.New()
+	var signhash []byte
+	r := big.NewInt(0)
+	s := big.NewInt(0)
+	io.WriteString(h, strconv.Itoa(data))
+	signhash = h.Sum(nil)
+	r, s, err := dsa.Sign(rand.Reader, privateKey, signhash)
+	if err != nil {
+		log.Fatalf("Failed to generate signature %v", err)
+   	}
+	return r.Int64(), s.Int64(), signhash
 }
 
 // The main service loop. All modifications to the KV store are run through here.
@@ -210,8 +254,10 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int, f i
 		currentTerm: 0,
 		commitIndex: -1,
 		lastApplied: -1,
-		hash: make([]int64, 0),
+		hash: make(int64, 0),
 		log: make([]*pb.Entry, 0),
+		publicKey: new(dsa.PublicKey),
+		privateKey: new(dsa.PublicKey),
 		results: make([]*pb.Result, 0),
 		votes: make(map[string]*pb.Vote),
 		nextIndex: make(map[string]int64),
@@ -220,6 +266,19 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int, f i
 		commitQuorum: make(map[int64]map[string]int64),
 		leaderChangeVotes: make(map[string]LeaderChangeProof),
 	}
+
+	// Generate public and private keys
+	params := new(dsa.Parameters)
+	if err := dsa.GenerateParameters(params, rand.Reader, dsa.L1024N160); err != nil {
+		log.Fatalf("Failed to generate parameters for DSA.")
+   	}
+	state.privateKey.PublicKey.Parameters = *params
+	dsa.GenerateKey(state.privateKey, rand.Reader) // this generates a public & private key pair
+  	state.publicKey = privatekey.PublicKey
+
+	var serPubKey bytes.Buffer
+	enc := gob.NewEncoder(&serPubKey)
+	enc.Encode(&state.publicKey)
 
 	// Initialize nextIndex and matchIndex
 	for _, peer := range *peers {
@@ -272,6 +331,10 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int, f i
 			// *************************************************
 			//   The timer went off. Request for leader change
 			// *************************************************
+
+			// Generate the hash and its signature
+			r, s, signhash := generateSignature(state.privateKey, state.currentTerm + 1)
+
 			newCandidate = (state.currentTerm + 1) % len(peers) + 1
 			go func(c pb.RaftClient, p string) {
 				ret, err := c.RequestLeaderChange(
@@ -283,7 +346,12 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int, f i
 					&pb.LeaderChangeProof{
 						Peer: id,
 						Term: state.currentTerm + 1,
-						Signature: 100, // TODO:
+						Signature: pb.Signature{
+							R: r,
+							S: s,
+							SignHash: signhash,
+							PublicKey: serPubKey.Bytes(),
+						},
 					},
 				)
 			}(peerClients[newCandidate], newCandidate)
@@ -301,7 +369,8 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int, f i
 					// requests, start election
 					state.currentTerm += 1 // Increment currentTerm
 					state.votedFor = id // Vote for self
-					state.voteCounts += 1 // Increment votes received count
+					// state.voteCounts += 1 // Increment votes received count
+					state.votes[id] = // TODO:
 					state.leaderID = "" // Become a candidate now
 					log.Printf("Timeout")
 					lastLogIndex := int64(-1)
@@ -398,7 +467,7 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int, f i
 					Term: state.currentTerm,
 					Index: oldLogLength, // accounting for zero indexed logs
 					Cmd: &op.command,
-					Sign: &op.signature,
+					Signature: &op.signature,
 				})
 				log.Printf("Leader logs: ")
 				PrintLog(state.log)
@@ -525,13 +594,24 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int, f i
 
 		case vr := <-raft.VoteChan:
 			// We received a RequestVote RPC from a raft peer
+			r, s, signhash := generateSignature(state.privateKey, state.currentTerm)
+			signedVote := pb.Vote{
+				Peer: id,
+				Term: state.currentTerm,
+				Signature: pb.Signature{
+					R: r,
+					S: s,
+					SignHash: signhash,
+					PublicKey: serPubKey.Bytes(),
+				},
+			}
 			log.Printf("Received vote request from %v", vr.arg.CandidateID)
 			if vr.arg.Term < state.currentTerm {
 				// Reply false if term < currentTerm, send currentTerm for candidate to updated itself
 				vr.response <- pb.RequestVoteRet{Term: state.currentTerm, VoteGranted: false}
 				break
 			}
-			leaderChangeProof = candidateVerification(vr.arg.LeaderChangeProof)
+			leaderChangeProof = candidateVerification(vr.arg.LeaderChangeProof, f)
 			if vr.arg.Term > state.currentTerm && leaderChangeProof {
 				// If receiving term is greater, then turn into a follower
 				state.currentTerm = vr.arg.Term
@@ -546,14 +626,14 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int, f i
 					state.voteCounts = 0
 					state.votedFor = vr.arg.CandidateID
 					state.leaderID = ""
-					vr.response <- pb.RequestVoteRet{Term: state.currentTerm, VoteGranted: true}
+					vr.response <- pb.RequestVoteRet{Term: state.currentTerm, VoteGranted: true, SignedVote: signedVote}
 					restartTimer(timer, r)
 				} else if vr.arg.LasLogTerm > state.log[len(state.log) - 1].GetTerm() {
 					state.currentTerm = vr.arg.Term
 					state.voteCounts = 0
 					state.votedFor = vr.arg.CandidateID
 					state.leaderID = ""
-					vr.response <- pb.RequestVoteRet{Term: state.currentTerm, VoteGranted: true}
+					vr.response <- pb.RequestVoteRet{Term: state.currentTerm, VoteGranted: true, SignedVote: signedVote}
 					restartTimer(timer, r)
 				} else if vr.arg.LasLogTerm == state.log[len(state.log) - 1].GetTerm() {
 					if vr.arg.LastLogIndex >= int64(len(state.log)-1) {
@@ -561,7 +641,7 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int, f i
 						state.voteCounts = 0
 						state.votedFor = vr.arg.CandidateID
 						state.leaderID = ""
-						vr.response <- pb.RequestVoteRet{Term: state.currentTerm, VoteGranted: true}
+						vr.response <- pb.RequestVoteRet{Term: state.currentTerm, VoteGranted: true, SignedVote: signedVote}
 						restartTimer(timer, r)
 					} else {
 						vr.response <- pb.RequestVoteRet{Term: state.currentTerm, VoteGranted: false}
@@ -585,7 +665,7 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int, f i
 															vr.ret.VoteGranted,
 															vr.ret.Term)
 					if vr.ret.VoteGranted == true {
-						state.votes[vr.arg.] = vr.ret.SignedVote
+						state.votes[vr.peer] = vr.ret.SignedVote
 						// Check if you made the majority
 						if len(state.votes) >= 2*f + 1 {
 							// **********************************************************
