@@ -6,6 +6,16 @@ import (
 	"log"
 	"os"
 
+	"io"
+	"hash"
+	"bytes"
+	"strconv"
+	"math/big"
+    "crypto/dsa"
+	"crypto/md5"
+	random "crypto/rand"
+    "encoding/gob"
+
 	context "golang.org/x/net/context"
 	"google.golang.org/grpc"
 
@@ -15,6 +25,22 @@ import (
 func usage() {
 	fmt.Printf("Usage %s <endpoint>\n", os.Args[0])
 	flag.PrintDefaults()
+}
+
+func generateSignature(privateKey *dsa.PrivateKey, data int64) (int64, int64, []byte) {
+	// Sign
+	var h hash.Hash
+	h = md5.New()
+	var signhash []byte
+	r := big.NewInt(0)
+	s := big.NewInt(0)
+	io.WriteString(h, strconv.Itoa(int(data)))
+	signhash = h.Sum(nil)
+	r, s, err := dsa.Sign(random.Reader, privateKey, signhash)
+	if err != nil {
+		log.Fatalf("Failed to generate signature %v", err)
+   	}
+	return r.Int64(), s.Int64(), signhash
 }
 
 func main() {
@@ -49,8 +75,30 @@ func main() {
 
 	// Create a KvStore client
 	kvc := pb.NewKvStoreClient(conn)
+
+	// Signature
+	// Generate public and private keys
+	params := new(dsa.Parameters)
+	if err := dsa.GenerateParameters(params, random.Reader, dsa.L1024N160); err != nil {
+		log.Fatalf("Failed to generate parameters for DSA.")
+   	}
+	privateKey := new(dsa.PrivateKey)
+	privateKey.PublicKey.Parameters = *params
+	dsa.GenerateKey(privateKey, random.Reader) // this generates a public & private key pair
+
+	var publicKey dsa.PublicKey
+	publicKey = privateKey.PublicKey
+
+	var serPubKey bytes.Buffer
+	enc := gob.NewEncoder(&serPubKey)
+	enc.Encode(publicKey)
+
+	r, s, signhash := generateSignature(privateKey, 100)
+
+	signature := &pb.ClientSignature{Id: id, Signature: &pb.Signature{R:r, S:s, SignHash: signhash, PublicKey: serPubKey.Bytes()}}
+
 	// Clear KVC
-	res, err := kvc.Clear(context.Background(), &pb.Empty{}, pb.ClientSignature{Id: id, Signature: 100})
+	res, err := kvc.Clear(context.Background(), &pb.Empty{Signature: signature})
 	if err != nil {
 		log.Fatalf("Could not clear")
 	}
@@ -61,8 +109,8 @@ func main() {
 	}
 
 	// Put setting hello -> 1
-	putReq := &pb.KeyValue{Key: "hello", Value: "1"}
-	res, err = kvc.Set(context.Background(), putReq, pb.ClientSignature{Id: id, Signature: 100})
+	putReq := &pb.KeyValue{Key: "hello", Value: "1", Signature: signature}
+	res, err = kvc.Set(context.Background(), putReq)
 	if err != nil {
 		log.Fatalf("Put error")
 	}
@@ -78,8 +126,8 @@ func main() {
 	}
 
 	// Request value for hello
-	req := &pb.Key{Key: "hello"}
-	res, err = kvc.Get(context.Background(), req, pb.ClientSignature{Id: id, Signature: 100})
+	req := &pb.Key{Key: "hello", Signature: signature}
+	res, err = kvc.Get(context.Background(), req)
 	if err != nil {
 		log.Fatalf("Request error %v", err)
 	}
@@ -95,8 +143,8 @@ func main() {
 	}
 
 	// Successfully CAS changing hello -> 2
-	casReq := &pb.CASArg{Kv: &pb.KeyValue{Key: "hello", Value: "1"}, Value: &pb.Value{Value: "2"}}
-	res, err = kvc.CAS(context.Background(), casReq, pb.ClientSignature{Id: id, Signature: 100})
+	casReq := &pb.CASArg{Kv: &pb.KeyValue{Key: "hello", Value: "1"}, Value: &pb.Value{Value: "2"}, Signature: signature}
+	res, err = kvc.CAS(context.Background(), casReq)
 	if err != nil {
 		log.Fatalf("Request error %v", err)
 	}
@@ -112,8 +160,8 @@ func main() {
 	}
 
 	// Unsuccessfully CAS
-	casReq = &pb.CASArg{Kv: &pb.KeyValue{Key: "hello", Value: "1"}, Value: &pb.Value{Value: "3"}}
-	res, err = kvc.CAS(context.Background(), casReq, pb.ClientSignature{Id: id, Signature: 100})
+	casReq = &pb.CASArg{Kv: &pb.KeyValue{Key: "hello", Value: "1"}, Value: &pb.Value{Value: "3"}, Signature: signature}
+	res, err = kvc.CAS(context.Background(), casReq)
 	if err != nil {
 		log.Fatalf("Request error %v", err)
 	}
@@ -129,8 +177,8 @@ func main() {
 	}
 
 	// CAS should fail for uninitialized variables
-	casReq = &pb.CASArg{Kv: &pb.KeyValue{Key: "hellooo", Value: "1"}, Value: &pb.Value{Value: "2"}}
-	res, err = kvc.CAS(context.Background(), casReq, pb.ClientSignature{Id: id, Signature: 100})
+	casReq = &pb.CASArg{Kv: &pb.KeyValue{Key: "hellooo", Value: "1"}, Value: &pb.Value{Value: "2"}, Signature: signature}
+	res, err = kvc.CAS(context.Background(), casReq)
 	if err != nil {
 		log.Fatalf("Request error %v", err)
 	}

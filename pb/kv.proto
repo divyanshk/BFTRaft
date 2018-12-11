@@ -5,6 +5,7 @@ package pb;
 // Represents a single key, used for gets.
 message Key {
     string key = 1;
+    ClientSignature signature = 2;
 }
 
 // Represents a single value, can be used for put etc.
@@ -16,6 +17,7 @@ message Value {
 message KeyValue {
     string key = 1;
     string value = 2;
+    ClientSignature signature = 3;
 }
 
 // Represent a void message indicating success
@@ -31,10 +33,13 @@ message Error {
 message CASArg {
     KeyValue kv = 1;
     Value value = 2;
+    ClientSignature signature = 3;
 }
 
 // Represents an empty message
-message Empty {}
+message Empty {
+    ClientSignature signature = 1;
+}
 
 // Represents a case where we need the client to connect
 // to another server.
@@ -84,20 +89,14 @@ message Entry {
     int64 term = 1;
     int64 index = 2;
     Command cmd = 3;
-    Signature sign = 4;
+    ClientSignature signature = 4;
 }
 
 // Signed Vote entry
 message Vote {
-    int64 peer = 1;
+    string peer = 1;
     int64 term = 2;
-    int64 signature = 3;
-}
-
-// Client signatures
-message ClientSignature {
-    int64 id = 1;
-    int64 signature = 2;
+    Signature signature = 3;
 }
 
 // Input to AppendEntries
@@ -135,21 +134,39 @@ message RequestVoteRet {
 
 // Proof for Leader Change request
 message LeaderChangeProof {
-    int64 peer = 1;
+    string peer = 1;
     int64 term = 2;
-    int64 signature = 3;
+    Signature signature = 3;
 }
 
 // Input to AppendEntriesRes
 message AppendEntriesResArgs {
-    int64 peer = 1;
+    string peer = 1;
     int64 index = 2;
     int64 hash = 3;
 }
+
+// Signature
+message Signature {
+    int64 r = 1;
+    int64 s = 2;
+    bytes signHash = 3;
+    bytes publicKey = 4;
+}
+
+// Client signatures
+message ClientSignature {
+    string id = 1;
+    Signature signature = 2;
+}
+
+// Empty message
+message Void {}
 
 // Raft service
 service Raft {
     rpc AppendEntries(AppendEntriesArgs) returns (AppendEntriesRet) {}
     rpc RequestVote(RequestVoteArgs) returns (RequestVoteRet) {}
-    rpc RequestLeaderChange(LeaderChangeProof) {}
-    rpc AppendEntriesRes(AppendEntriesResArgs) {}
+    rpc RequestLeaderChange(LeaderChangeProof) returns (Void) {}
+    rpc AppendEntriesRes(AppendEntriesResArgs) returns (Void) {}
+}

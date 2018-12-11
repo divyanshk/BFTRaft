@@ -5,13 +5,14 @@ import (
 
 	context "golang.org/x/net/context"
 
-	"github.com/nyu-distributed-systems-fa18/lab-2-raft-divyanshk/pb"
+	"github.com/nyu-distributed-systems-fa18/distributed-project/pb"
 )
 
 // The struct for data to send over channel
 type InputChannelType struct {
-	command  pb.Command
-	response chan pb.Result
+	command   pb.Command
+	response  chan pb.Result
+	signature pb.ClientSignature
 }
 
 // The struct for key value stores.
@@ -26,7 +27,7 @@ func (s *KVStore) Get(ctx context.Context, key *pb.Key) (*pb.Result, error) {
 	// Create a request
 	r := pb.Command{Operation: pb.Op_GET, Arg: &pb.Command_Get{Get: key}}
 	// Send request over the channel
-	s.C <- InputChannelType{command: r, response: c}
+	s.C <- InputChannelType{command: r, response: c, signature: *key.Signature}
 	log.Printf("Waiting for get response")
 	result := <-c
 	// The bit below works because Go maps return the 0 value for non existent keys, which is empty in this case.
@@ -39,7 +40,7 @@ func (s *KVStore) Set(ctx context.Context, in *pb.KeyValue) (*pb.Result, error) 
 	// Create a request
 	r := pb.Command{Operation: pb.Op_SET, Arg: &pb.Command_Set{Set: in}}
 	// Send request over the channel
-	s.C <- InputChannelType{command: r, response: c}
+	s.C <- InputChannelType{command: r, response: c, signature: *in.Signature}
 	log.Printf("Waiting for set response")
 	result := <-c
 	// The bit below works because Go maps return the 0 value for non existent keys, which is empty in this case.
@@ -52,7 +53,7 @@ func (s *KVStore) Clear(ctx context.Context, in *pb.Empty) (*pb.Result, error) {
 	// Create a request
 	r := pb.Command{Operation: pb.Op_CLEAR, Arg: &pb.Command_Clear{Clear: in}}
 	// Send request over the channel
-	s.C <- InputChannelType{command: r, response: c}
+	s.C <- InputChannelType{command: r, response: c, signature: *in.Signature}
 	log.Printf("Waiting for clear response")
 	result := <-c
 	// The bit below works because Go maps return the 0 value for non existent keys, which is empty in this case.
@@ -65,7 +66,7 @@ func (s *KVStore) CAS(ctx context.Context, in *pb.CASArg) (*pb.Result, error) {
 	// Create a request
 	r := pb.Command{Operation: pb.Op_CAS, Arg: &pb.Command_Cas{Cas: in}}
 	// Send request over the channel
-	s.C <- InputChannelType{command: r, response: c}
+	s.C <- InputChannelType{command: r, response: c, signature: *in.Signature}
 	log.Printf("Waiting for CAS response")
 	result := <-c
 	// The bit below works because Go maps return the 0 value for non existent keys, which is empty in this case.
