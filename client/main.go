@@ -93,9 +93,11 @@ func main() {
 	enc := gob.NewEncoder(&serPubKey)
 	enc.Encode(publicKey)
 
-	r, s, signhash := generateSignature(privateKey, 100)
+	r_, s_, signhash := generateSignature(privateKey, 100)
+	// fmt.Printf("%x \n", publicKey)
+	signature := &pb.ClientSignature{Id: id, Signature: &pb.Signature{R:r_, S:s_, SignHash: signhash, PublicKey: serPubKey.Bytes()}}
 
-	signature := &pb.ClientSignature{Id: id, Signature: &pb.Signature{R:r, S:s, SignHash: signhash, PublicKey: serPubKey.Bytes()}}
+	// log.Printf(signature.String())
 
 	// Clear KVC
 	res, err := kvc.Clear(context.Background(), &pb.Empty{Signature: signature})

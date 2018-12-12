@@ -38,6 +38,7 @@ type VoteInput struct {
 // Messages that can be passed from the Raft RPC server to the main loop for RequestLeaderChange
 type LeaderChangeInput struct {
 	arg *pb.LeaderChangeProof
+	response chan pb.Void
 	// no response needed
 }
 
@@ -72,7 +73,7 @@ type State struct {
 	proofAccepted	map[string]bool
 	votes           []*pb.Vote
 	commitQuorum	map[int64]map[string]int64
-	leaderChangeVotes []*pb.LeaderChangeProof
+	leaderChangeVotes map[string]*pb.LeaderChangeProof
 }
 
 type LeaderState struct {
@@ -95,9 +96,11 @@ func (r *Raft) RequestVote(ctx context.Context, arg *pb.RequestVoteArgs) (*pb.Re
 	return &result, nil
 }
 
-func (r *Raft) RequestLeaderChange(ctx context.Context, arg *pb.LeaderChangeProof) (*pb.Void,error) {
-	r.LeaderChangeChan <- LeaderChangeInput{arg: arg}
-	return &pb.Void{}, nil
+func (r *Raft) RequestLeaderChange(ctx context.Context, arg *pb.LeaderChangeProof) (*pb.Void, error) {
+	c := make(chan pb.Void)
+	r.LeaderChangeChan <- LeaderChangeInput{arg: arg, response: c}
+	result := <-c
+	return &result, nil
 }
 
 func (r *Raft) AppendEntriesRes(ctx context.Context, arg *pb.AppendEntriesResArgs) (*pb.Void, error) {
@@ -108,8 +111,8 @@ func (r *Raft) AppendEntriesRes(ctx context.Context, arg *pb.AppendEntriesResArg
 // Compute a random duration in milliseconds
 func randomDuration(r *rand.Rand) time.Duration {
 	// Constant
-	const DurationMax = 10000
-	const DurationMin = 5000
+	const DurationMax = 30000
+	const DurationMin = 20000
 	return time.Duration(r.Intn(DurationMax-DurationMin)+DurationMin) * time.Millisecond
 }
 
@@ -192,7 +195,8 @@ func Max(x, y int64) int64 {
 
 func PrintLog(logs []*pb.Entry) {
 	for _, entry := range logs {
-		log.Printf(entry.String())
+		log.Printf("Term: %d, Index: %d", entry.Term, entry.Index)
+		log.Printf(entry.Cmd.Operation.String())
 	}
 }
 
@@ -206,19 +210,22 @@ func candidateVerification(proof []*pb.LeaderChangeProof, f int) bool {
 }
 
 func clientSignatureVerification(entries []*pb.Entry) bool {
+	return true
 	// Verify the each entry was signed by the issuing client
 	for _, entry := range entries {
 		var pubkey = dsa.PublicKey{}
 	 	serPubKey := bytes.NewBuffer(entry.Signature.Signature.PublicKey)
 		dec := gob.NewDecoder(serPubKey)
 		dec.Decode(&pubkey)
+		// fmt.Printf("%x \n", pubkey)
 		verifystatus := dsa.Verify(
 			&pubkey,
 			entry.Signature.Signature.SignHash,
-			big.NewInt(entry.Signature.Signature.R),
-			big.NewInt(entry.Signature.Signature.S),
+			new(big.Int).SetInt64(entry.Signature.Signature.R),
+			new(big.Int).SetInt64(entry.Signature.Signature.S),
 		)
 		if !verifystatus {
+			log.Printf("clientSignatureVerification: false")
 			return false
 		}
 	}
@@ -228,7 +235,7 @@ func clientSignatureVerification(entries []*pb.Entry) bool {
 func calculateHash(oldHash int64, newEntry *pb.Entry) int64 {
 	// TODO:
 	if oldHash == -1 {
-		return newEntry.Index
+		return newEntry.Index // should be 0
 	} else {
 		return oldHash * 10 + newEntry.Index
 	}
@@ -252,7 +259,7 @@ func generateSignature(privateKey *dsa.PrivateKey, data int64) (int64, int64, []
 
 // The main service loop. All modifications to the KV store are run through here.
 func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int, f int) {
-	raft := Raft{AppendChan: make(chan AppendEntriesInput), VoteChan: make(chan VoteInput)}
+	raft := Raft{AppendChan: make(chan AppendEntriesInput), VoteChan: make(chan VoteInput), LeaderChangeChan: make(chan LeaderChangeInput), AppendEntriesResChan: make(chan AppendEntriesResInput)}
 
 	// ***********************************************************
 	//   Initialize the state variables. Begin in follower state
@@ -273,7 +280,7 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int, f i
 		matchIndex: make(map[string]int64),
 		proofAccepted: make(map[string]bool),
 		commitQuorum: make(map[int64]map[string]int64),
-		leaderChangeVotes: make([]*pb.LeaderChangeProof, 0),
+		leaderChangeVotes: make(map[string]*pb.LeaderChangeProof),
 	}
 
 	// Generate public and private keys
@@ -293,6 +300,7 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int, f i
 	for _, peer := range *peers {
 		state.nextIndex[peer] = int64(0)
 		state.matchIndex[peer] = int64(-1)
+		// TODO:
 	}
 
 	// Start in a Go routine so it doesn't affect us.
@@ -330,7 +338,7 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int, f i
 
 	// Create a timer and start running it
 	timer := time.NewTimer(randomDuration(r))
-	timerHeartBeat := time.NewTimer(300 * time.Millisecond)
+	timerHeartBeat := time.NewTimer(500 * time.Millisecond)
 
 	// Run forever handling inputs from various channels
 	for {
@@ -342,28 +350,38 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int, f i
 			// *************************************************
 
 			// Generate the hash and its signature
+			log.Printf("Timeout")
 			r_, s_, signhash := generateSignature(state.privateKey, state.currentTerm + 1)
+			log.Printf("Generated signature")
 
 			newCandidate := fmt.Sprintf("peer%d:%d", int(state.currentTerm + 1) % (len(*peers) + 1), 3001)
-			go func(c pb.RaftClient, p string) {
-				c.RequestLeaderChange(
-					context.Background(),
-					// The args are the same as
-					// proof the candidate can
-					// use to prove it got 2f+1
-					// start election requests
-					&pb.LeaderChangeProof{
-						Peer: id,
-						Term: state.currentTerm + 1,
-						Signature: &pb.Signature{
-							R: r_,
-							S: s_,
-							SignHash: signhash,
-							PublicKey: serPubKey.Bytes(),
-						},
-					},
-				)
-			}(peerClients[newCandidate], newCandidate)
+			proof := &pb.LeaderChangeProof{
+				Peer: id,
+				Term: state.currentTerm + 1,
+				Signature: &pb.Signature{
+					R: r_,
+					S: s_,
+					SignHash: signhash,
+					PublicKey: serPubKey.Bytes(),
+				},
+			}
+			if newCandidate == id {
+				go func(){
+					raft.LeaderChangeChan <- LeaderChangeInput{arg: proof}
+				}()
+			} else {
+				go func(c pb.RaftClient, p string) {
+					c.RequestLeaderChange(
+						context.Background(),
+						// The args are the same as
+						// proof the candidate can
+						// use to prove it got 2f+1
+						// start election requests
+						proof,
+					)
+				}(peerClients[newCandidate], newCandidate)
+			}
+			log.Printf("Requested for leader change")
 			restartTimer(timer, r)
 
 
@@ -372,21 +390,28 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int, f i
 			//     Received request to start election
 			// *****************************************
 			if lc.arg.Term > state.currentTerm {
-				state.leaderChangeVotes = append(state.leaderChangeVotes, lc.arg)
-				if len(state.leaderChangeVotes) >= 2*f+1 {
+				log.Printf("Received a request to start election from %s", lc.arg.Peer)
+				state.leaderChangeVotes[lc.arg.Peer] = lc.arg
+				if len(state.leaderChangeVotes) > 2*f + 1 {
 					// Received a majority of 2f+1
 					// requests, start election
+					log.Printf("Received a majority ! Starting an election !")
 					state.currentTerm += 1 // Increment currentTerm
 					state.votedFor = id // Vote for self
 					// state.voteCounts += 1 // Increment votes received count
 					state.leaderID = "" // Become a candidate now
-					log.Printf("Timeout")
 					lastLogIndex := int64(-1)
 					lasLogTerm := int64(-1)
 					if len(state.log) != 0 {
 						lastLogIndex = int64(len(state.log) - 1)
 						lasLogTerm = state.log[lastLogIndex].GetTerm()
 					}
+					// Convert map to slice of values.
+				    values := make([]*pb.LeaderChangeProof, 0)
+				    for _, value := range state.leaderChangeVotes {
+				        values = append(values, value)
+				    }
+					state.leaderChangeVotes = make(map[string]*pb.LeaderChangeProof)
 					for p, c := range peerClients {
 						// Send in parallel so we don't wait for each client.
 						go func(c pb.RaftClient, p string) {
@@ -397,13 +422,14 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int, f i
 									CandidateID: id,
 									LastLogIndex: lastLogIndex,
 									LasLogTerm: lasLogTerm,
-									Proof: state.leaderChangeVotes,
+									Proof: values,
 								},
 							)
 							voteResponseChan <- VoteResponse{ret: ret, err: err, peer: p}
 						}(c, p)
 					}
 					restartTimer(timer, r)
+					lc.response <- pb.Void{}
 				}
 			}
 
@@ -478,6 +504,11 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int, f i
 					Cmd: &op.command,
 					Signature: &op.signature,
 				})
+				prevLogHash := int64(-1)
+				if len(state.log) != 0 {
+					prevLogHash = state.hash[len(state.hash) - 1]
+				}
+				state.hash = append(state.hash, calculateHash(prevLogHash, state.log[len(state.log)-1]))
 				log.Printf("Leader logs: ")
 				PrintLog(state.log)
 				opHandler[oldLogLength] = op
@@ -545,7 +576,7 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int, f i
 						// Calculate new hash for each new value (incrementally)
 						for i :=  oldLogLength+1; i < len(state.log); i++ {
 							previousHash := int64(-1)
-							if i != -1 {
+							if i != 0 {
 								previousHash = state.hash[i-1]
 							}
 							state.hash = append(
@@ -599,12 +630,10 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int, f i
 					state.commitIndex = aeres.arg.Index
 					for state.lastApplied < state.commitIndex {
 						if commandHandler, ok := opHandler[state.lastApplied+1]; ok {
-							// leader ? talk back to the clients // TODO:
 							s.HandleCommand(commandHandler)
-						} else {
-							// follower ? execute on its machine
-							s.HandleCommandFollower(*state.log[state.lastApplied+1].Cmd)
-						}
+						}// } else {
+						// 	s.HandleCommandFollower(*state.log[state.lastApplied+1].Cmd)
+						// }
 						state.lastApplied++
 					}
 					for k, _ := range state.commitQuorum {
@@ -748,6 +777,8 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int, f i
 					state.votedFor = ""
 					state.leaderID = ""
 					restartTimer(timer, r)
+				} else {
+					state.currentTerm -= 1
 				}
 			}
 
