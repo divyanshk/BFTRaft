@@ -538,7 +538,7 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int, f i
 				if ae.arg.PrevLogIndex <= int64(len(state.log) - 1) {
 					// Match with the incremental hash instead of the previous entry's term
 					if ae.arg.PrevLogIndex == int64(-1) ||
-					   state.hash[len(state.hash)-1] == ae.arg.PrevLogHash {
+					   state.hash[len(state.log)-1] == ae.arg.PrevLogHash {
 						// Append new entries after ae.arg.PrevLogIndex
 						// Delete an entry only if there is a mismatch
 
@@ -577,13 +577,14 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int, f i
 						for i :=  oldLogLength+1; i < len(state.log); i++ {
 							previousHash := int64(-1)
 							if i != 0 {
-								previousHash = state.hash[i-1]
+								previousHash = state.hash[i]
 							}
 							state.hash = append(
 								state.hash,
 								calculateHash(int64(previousHash), state.log[i]),
 							)
 						}
+						fmt.Println(state.hash)
 
 						// Broadcast AppendEntriesRes to all peers
 						for p, c := range peerClients {
@@ -741,7 +742,7 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int, f i
 							prevLogHash := int64(-1)
 							if len(state.log) != 0 {
 								prevLogIndex = int64(len(state.log)) - 1
-								prevLogHash = state.hash[len(state.hash) - 1]
+								prevLogHash = state.hash[len(state.log) - 1]
 							}
 							opHandler = make(map[int64]InputChannelType)
 
